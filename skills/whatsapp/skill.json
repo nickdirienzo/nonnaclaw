@@ -1,0 +1,13 @@
+{
+  "name": "whatsapp",
+  "version": "1.0.0",
+  "description": "WhatsApp channel via Baileys",
+  "inbound": {
+    "entrypoint": "./dist/service.js",
+    "persistent": true
+  },
+  "outbound": {
+    "jidPatterns": ["*@g.us", "*@s.whatsapp.net", "*@lid"]
+  },
+  "envKeys": ["ASSISTANT_NAME", "ASSISTANT_HAS_OWN_NUMBER"]
+}

@@ -24,7 +24,15 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
-import { RegisteredGroup } from './types.js';
+import { collectMcpServers } from './skill-registry.js';
+import { LoadedSkill, RegisteredGroup } from './types.js';
+
+// Module-level state for loaded skills (set by orchestrator on startup)
+let loadedSkills: LoadedSkill[] = [];
+
+export function setLoadedSkills(skills: LoadedSkill[]): void {
+  loadedSkills = skills;
+}
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -39,6 +47,10 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  additionalMcpServers?: Record<
+    string,
+    { command: string; args?: string[]; env?: Record<string, string> }
+  >;
 }
 
 export interface ContainerOutput {
@@ -293,12 +305,21 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
+    // Inject MCP servers for authorized skills
+    if (group.authorizedMcpServers && group.authorizedMcpServers.length > 0) {
+      input.additionalMcpServers = collectMcpServers(
+        loadedSkills,
+        group.authorizedMcpServers,
+      );
+    }
+
     // Pass secrets via stdin (never written to disk or mounted as files)
     input.secrets = readSecrets();
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
     // Remove secrets from input so they don't appear in logs
     delete input.secrets;
+    delete input.additionalMcpServers;
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';

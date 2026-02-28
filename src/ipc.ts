@@ -13,13 +13,15 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import { writeOutboxEvent } from './outbox.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
-  syncGroupMetadata: (force: boolean) => Promise<void>;
+  syncGroupMetadata?: (force: boolean) => Promise<void>;
+  resolveSkillForJid?: (jid: string) => string | undefined;
   getAvailableGroups: () => AvailableGroup[];
   writeGroupsSnapshot: (
     groupFolder: string,
@@ -79,7 +81,26 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  try {
+                    await deps.sendMessage(data.chatJid, data.text);
+                  } catch {
+                    // No channel owns this JID — try skill outbox routing
+                    const skillName = deps.resolveSkillForJid?.(data.chatJid);
+                    if (skillName) {
+                      writeOutboxEvent(skillName, {
+                        type: 'message',
+                        jid: data.chatJid,
+                        text: data.text,
+                        sender: data.sender,
+                        timestamp: new Date().toISOString(),
+                      });
+                    } else {
+                      logger.warn(
+                        { chatJid: data.chatJid, sourceGroup },
+                        'No channel or skill for JID',
+                      );
+                    }
+                  }
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',
@@ -331,7 +352,11 @@ export async function processTaskIpc(
           { sourceGroup },
           'Group metadata refresh requested via IPC',
         );
-        await deps.syncGroupMetadata(true);
+        if (deps.syncGroupMetadata) {
+          await deps.syncGroupMetadata(true);
+        } else {
+          logger.debug('No syncGroupMetadata handler (channel managed by skill)');
+        }
         // Write updated snapshot immediately
         const availableGroups = deps.getAvailableGroups();
         deps.writeGroupsSnapshot(

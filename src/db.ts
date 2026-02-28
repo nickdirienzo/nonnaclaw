@@ -82,6 +82,12 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS channel_mappings (
+      channel TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      jid TEXT NOT NULL,
+      PRIMARY KEY (channel, chat_id)
+    );
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -102,6 +108,15 @@ function createSchema(database: Database.Database): void {
     database
       .prepare(`UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`)
       .run(`${ASSISTANT_NAME}:%`);
+  } catch {
+    /* column already exists */
+  }
+
+  // Add authorized_mcp_servers column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN authorized_mcp_servers TEXT`,
+    );
   } catch {
     /* column already exists */
   }
@@ -263,7 +278,7 @@ export function storeMessage(msg: NewMessage): void {
 }
 
 /**
- * Store a message directly (for non-WhatsApp channels that don't use Baileys proto).
+ * Store a message directly (for channels/skills that provide pre-formatted messages).
  */
 export function storeMessageDirect(msg: {
   id: string;
@@ -530,6 +545,7 @@ export function getRegisteredGroup(
         added_at: string;
         container_config: string | null;
         requires_trigger: number | null;
+        authorized_mcp_servers: string | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -551,6 +567,9 @@ export function getRegisteredGroup(
       : undefined,
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
+    authorizedMcpServers: row.authorized_mcp_servers
+      ? JSON.parse(row.authorized_mcp_servers)
+      : undefined,
   };
 }
 
@@ -559,8 +578,8 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, authorized_mcp_servers)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -569,6 +588,9 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.added_at,
     group.containerConfig ? JSON.stringify(group.containerConfig) : null,
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
+    group.authorizedMcpServers
+      ? JSON.stringify(group.authorizedMcpServers)
+      : null,
   );
 }
 
@@ -581,6 +603,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     added_at: string;
     container_config: string | null;
     requires_trigger: number | null;
+    authorized_mcp_servers: string | null;
   }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
@@ -601,9 +624,55 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
         : undefined,
       requiresTrigger:
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
+      authorizedMcpServers: row.authorized_mcp_servers
+        ? JSON.parse(row.authorized_mcp_servers)
+        : undefined,
     };
   }
   return result;
+}
+
+// --- Channel mapping accessors ---
+
+export function setChannelMapping(
+  channel: string,
+  chatId: string,
+  jid: string,
+): void {
+  db.prepare(
+    'INSERT OR REPLACE INTO channel_mappings (channel, chat_id, jid) VALUES (?, ?, ?)',
+  ).run(channel, chatId, jid);
+}
+
+export function getChannelMapping(
+  channel: string,
+  chatId: string,
+): string | undefined {
+  const row = db
+    .prepare(
+      'SELECT jid FROM channel_mappings WHERE channel = ? AND chat_id = ?',
+    )
+    .get(channel, chatId) as { jid: string } | undefined;
+  return row?.jid;
+}
+
+export function deleteChannelMapping(
+  channel: string,
+  chatId: string,
+): void {
+  db.prepare(
+    'DELETE FROM channel_mappings WHERE channel = ? AND chat_id = ?',
+  ).run(channel, chatId);
+}
+
+export function getAllChannelMappings(): Array<{
+  channel: string;
+  chat_id: string;
+  jid: string;
+}> {
+  return db
+    .prepare('SELECT channel, chat_id, jid FROM channel_mappings')
+    .all() as Array<{ channel: string; chat_id: string; jid: string }>;
 }
 
 // --- JSON migration ---

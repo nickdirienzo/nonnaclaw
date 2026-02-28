@@ -8,10 +8,10 @@ import {
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
-import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
   runContainerAgent,
+  setLoadedSkills,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -24,6 +24,7 @@ import {
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  getChannelMapping,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -32,14 +33,20 @@ import {
   setRouterState,
   setSession,
   storeChatMetadata,
-  storeMessage,
+  storeMessageDirect,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { writeOutboxEvent } from './outbox.js';
+import {
+  startInboundSchedulers,
+  stopInboundSchedulers,
+} from './skill-inbound.js';
+import { loadSkills, resolveSkillForJid } from './skill-registry.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { Channel, LoadedSkill, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -51,9 +58,40 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
-let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+let skills: LoadedSkill[] = [];
+
+/**
+ * Send a message to a JID, routing through channels first, then skill outbox.
+ */
+async function sendToJid(jid: string, text: string): Promise<void> {
+  const channel = findChannel(channels, jid);
+  if (channel) {
+    await channel.sendMessage(jid, text);
+    return;
+  }
+  const skillName = resolveSkillForJid(skills, jid);
+  if (skillName) {
+    writeOutboxEvent(skillName, {
+      type: 'message',
+      jid,
+      text,
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+  logger.warn({ jid }, 'No channel or skill for JID, cannot send message');
+}
+
+/**
+ * Check if we can send to a JID (via channel or skill).
+ */
+function canSendToJid(jid: string): boolean {
+  if (findChannel(channels, jid)) return true;
+  if (resolveSkillForJid(skills, jid)) return true;
+  return false;
+}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -134,9 +172,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const group = registeredGroups[chatJid];
   if (!group) return true;
 
-  const channel = findChannel(channels, chatJid);
-  if (!channel) {
-    logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+  if (!canSendToJid(chatJid)) {
+    logger.warn({ chatJid }, 'No channel or skill owns JID, skipping messages');
     return true;
   }
 
@@ -187,7 +224,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -202,7 +238,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        await sendToJid(chatJid, text);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -218,7 +254,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -365,9 +400,8 @@ async function startMessageLoop(): Promise<void> {
           const group = registeredGroups[chatJid];
           if (!group) continue;
 
-          const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+          if (!canSendToJid(chatJid)) {
+            logger.warn({ chatJid }, 'No channel or skill owns JID, skipping messages');
             continue;
           }
 
@@ -403,12 +437,6 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-              );
           } else {
             // No active container — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -451,9 +479,14 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
 
+  // Load skill system
+  skills = loadSkills();
+  setLoadedSkills(skills);
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    stopInboundSchedulers();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -461,25 +494,7 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Channel callbacks (shared by all channels)
-  const channelOpts = {
-    onMessage: (_chatJid: string, msg: NewMessage) => storeMessage(msg),
-    onChatMetadata: (
-      chatJid: string,
-      timestamp: string,
-      name?: string,
-      channel?: string,
-      isGroup?: boolean,
-    ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
-    registeredGroups: () => registeredGroups,
-  };
-
-  // Create and connect channels
-  whatsapp = new WhatsAppChannel(channelOpts);
-  channels.push(whatsapp);
-  await whatsapp.connect();
-
-  // Start subsystems (independently of connection handler)
+  // Start subsystems
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
@@ -487,28 +502,51 @@ async function main(): Promise<void> {
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) {
-        logger.warn({ jid }, 'No channel owns JID, cannot send message');
-        return;
-      }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text) await sendToJid(jid, text);
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
-    },
+    sendMessage: (jid, text) => sendToJid(jid, text),
     registeredGroups: () => registeredGroups,
     registerGroup,
-    syncGroupMetadata: (force) =>
-      whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),
+    resolveSkillForJid: (jid) => resolveSkillForJid(skills, jid),
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+  });
+  startInboundSchedulers(skills, {
+    resolveGroup: (channel, chatId) => {
+      const mapped = getChannelMapping(channel, chatId);
+      if (mapped) return mapped;
+      // If chatId looks like a JID (contains @), use it directly
+      if (chatId.includes('@')) return chatId;
+      return undefined;
+    },
+    storeAndNotify: (msg) => {
+      storeMessageDirect(msg);
+
+      // Bootstrap: auto-register first DM as main group when no groups exist
+      if (
+        Object.keys(registeredGroups).length === 0 &&
+        !msg.chat_jid.endsWith('@g.us') &&
+        !msg.is_bot_message
+      ) {
+        registerGroup(msg.chat_jid, {
+          name: 'Main',
+          folder: MAIN_GROUP_FOLDER,
+          trigger: ASSISTANT_NAME,
+          added_at: new Date().toISOString(),
+          requiresTrigger: false,
+        });
+        logger.info(
+          { jid: msg.chat_jid },
+          'Bootstrap: auto-registered first DM as main group',
+        );
+      }
+    },
+    storeChatMetadata: (chatJid, timestamp, name, channel, isGroup) =>
+      storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

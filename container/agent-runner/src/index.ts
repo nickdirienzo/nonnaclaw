@@ -28,6 +28,10 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  additionalMcpServers?: Record<
+    string,
+    { command: string; args?: string[]; env?: Record<string, string> }
+  >;
 }
 
 interface ContainerOutput {
@@ -414,6 +418,40 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Build MCP servers config: start with nanoclaw, merge any additional skill servers
+  const mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> = {
+    nanoclaw: {
+      command: 'node',
+      args: [mcpServerPath],
+      env: {
+        NANOCLAW_CHAT_JID: containerInput.chatJid,
+        NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+        NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+      },
+    },
+  };
+
+  // Build allowed tools list
+  const allowedTools = [
+    'Bash',
+    'Read', 'Write', 'Edit', 'Glob', 'Grep',
+    'WebSearch', 'WebFetch',
+    'Task', 'TaskOutput', 'TaskStop',
+    'TeamCreate', 'TeamDelete', 'SendMessage',
+    'TodoWrite', 'ToolSearch', 'Skill',
+    'NotebookEdit',
+    'mcp__nanoclaw__*',
+  ];
+
+  // Merge additional MCP servers from skills
+  if (containerInput.additionalMcpServers) {
+    for (const [name, config] of Object.entries(containerInput.additionalMcpServers)) {
+      mcpServers[name] = config;
+      allowedTools.push(`mcp__${name}__*`);
+    }
+    log(`Additional MCP servers: ${Object.keys(containerInput.additionalMcpServers).join(', ')}`);
+  }
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -424,31 +462,12 @@ async function runQuery(
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
-      allowedTools: [
-        'Bash',
-        'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TaskOutput', 'TaskStop',
-        'TeamCreate', 'TeamDelete', 'SendMessage',
-        'TodoWrite', 'ToolSearch', 'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*'
-      ],
+      allowedTools,
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-      },
+      mcpServers,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
         PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],

@@ -39,6 +39,59 @@ export interface RegisteredGroup {
   added_at: string;
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
+  authorizedMcpServers?: string[];
+}
+
+// --- Skill system types ---
+
+export interface SkillManifest {
+  name: string;
+  version: string;
+  description?: string;
+  inbound?: {
+    entrypoint: string; // relative path, e.g. "./inbound.js"
+    intervalMs?: number; // poll interval, min 1000ms (required for poll mode)
+    persistent?: boolean; // if true, process runs continuously (restart on crash)
+  };
+  outbound?: {
+    jidPatterns: string[]; // glob patterns for JIDs this skill handles, e.g. ["*@g.us"]
+  };
+  mcpServers?: Record<
+    string,
+    {
+      command: string;
+      args?: string[];
+      envKeys?: string[]; // env var names — values resolved from .env at runtime
+    }
+  >;
+  envKeys?: string[]; // env vars for the inbound entrypoint
+}
+
+export interface InboxEvent {
+  channel: string;
+  chatId: string;
+  type?: 'message' | 'chat_metadata'; // defaults to 'message'
+  content: string;
+  sender: string;
+  senderName: string;
+  timestamp: string; // ISO 8601
+  messageId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface OutboxEvent {
+  type: 'message' | 'typing';
+  jid: string;
+  text?: string;
+  isTyping?: boolean;
+  sender?: string;
+  timestamp: string;
+}
+
+export interface LoadedSkill {
+  manifest: SkillManifest;
+  dir: string; // absolute path to skill directory
+  inboundEnv?: Record<string, string>;
 }
 
 export interface NewMessage {
@@ -94,7 +147,7 @@ export type OnInboundMessage = (chatJid: string, message: NewMessage) => void;
 
 // Callback for chat metadata discovery.
 // name is optional — channels that deliver names inline (Telegram) pass it here;
-// channels that sync names separately (WhatsApp syncGroupMetadata) omit it.
+// channels that sync names separately (e.g., via metadata sync) omit it.
 export type OnChatMetadata = (
   chatJid: string,
   timestamp: string,
