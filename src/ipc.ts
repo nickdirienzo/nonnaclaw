@@ -355,7 +355,9 @@ export async function processTaskIpc(
         if (deps.syncGroupMetadata) {
           await deps.syncGroupMetadata(true);
         } else {
-          logger.debug('No syncGroupMetadata handler (channel managed by skill)');
+          logger.debug(
+            'No syncGroupMetadata handler (channel managed by skill)',
+          );
         }
         // Write updated snapshot immediately
         const availableGroups = deps.getAvailableGroups();

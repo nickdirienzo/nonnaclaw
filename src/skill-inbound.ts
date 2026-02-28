@@ -148,15 +148,25 @@ function scheduleSkill(skill: LoadedSkill, deps: InboundDeps): void {
       if (code === 0) {
         scheduler.failures = 0;
         if (isPersistent) {
-          logger.info({ skill: name }, 'Persistent service exited cleanly, restarting');
+          logger.info(
+            { skill: name },
+            'Persistent service exited cleanly, restarting',
+          );
         } else {
           logger.debug({ skill: name }, 'Inbound entrypoint completed');
         }
       } else {
         scheduler.failures++;
         logger.warn(
-          { skill: name, code, failures: scheduler.failures, persistent: isPersistent },
-          isPersistent ? 'Persistent service crashed' : 'Inbound entrypoint failed',
+          {
+            skill: name,
+            code,
+            failures: scheduler.failures,
+            persistent: isPersistent,
+          },
+          isPersistent
+            ? 'Persistent service crashed'
+            : 'Inbound entrypoint failed',
         );
       }
 
@@ -240,7 +250,10 @@ function pollInbox(deps: InboundDeps): void {
 
         // Message events require content
         if (!event.content) {
-          logger.warn({ file }, 'Malformed inbox event (no content), moving to errors');
+          logger.warn(
+            { file },
+            'Malformed inbox event (no content), moving to errors',
+          );
           fs.renameSync(filePath, path.join(ERRORS_DIR, file));
           continue;
         }

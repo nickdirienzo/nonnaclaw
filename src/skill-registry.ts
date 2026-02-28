@@ -84,9 +84,8 @@ export function loadSkills(skillsDir?: string): LoadedSkill[] {
 
     // Resolve env vars for the inbound entrypoint
     const allEnvKeys = manifest.envKeys || [];
-    const inboundEnv = allEnvKeys.length > 0
-      ? readEnvFile(allEnvKeys)
-      : undefined;
+    const inboundEnv =
+      allEnvKeys.length > 0 ? readEnvFile(allEnvKeys) : undefined;
 
     skills.push({ manifest, dir: skillDir, inboundEnv });
     logger.info(
@@ -110,9 +109,15 @@ export function loadSkills(skillsDir?: string): LoadedSkill[] {
 export function collectMcpServers(
   skills: LoadedSkill[],
   authorizedServerNames: string[],
-): Record<string, { command: string; args?: string[]; env?: Record<string, string> }> {
+): Record<
+  string,
+  { command: string; args?: string[]; env?: Record<string, string> }
+> {
   const authorized = new Set(authorizedServerNames);
-  const result: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> = {};
+  const result: Record<
+    string,
+    { command: string; args?: string[]; env?: Record<string, string> }
+  > = {};
 
   for (const skill of skills) {
     if (!skill.manifest.mcpServers) continue;

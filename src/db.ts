@@ -656,10 +656,7 @@ export function getChannelMapping(
   return row?.jid;
 }
 
-export function deleteChannelMapping(
-  channel: string,
-  chatId: string,
-): void {
+export function deleteChannelMapping(channel: string, chatId: string): void {
   db.prepare(
     'DELETE FROM channel_mappings WHERE channel = ? AND chat_id = ?',
   ).run(channel, chatId);

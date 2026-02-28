@@ -45,7 +45,9 @@ describe('writeOutboxEvent', () => {
     const files = fs.readdirSync(outboxDir).filter((f) => f.endsWith('.json'));
     expect(files).toHaveLength(1);
 
-    const written = JSON.parse(fs.readFileSync(path.join(outboxDir, files[0]), 'utf-8'));
+    const written = JSON.parse(
+      fs.readFileSync(path.join(outboxDir, files[0]), 'utf-8'),
+    );
     expect(written.type).toBe('message');
     expect(written.jid).toBe('12345@g.us');
     expect(written.text).toBe('Hello world');
@@ -89,7 +91,9 @@ describe('writeOutboxEvent', () => {
     });
 
     const outboxDir = path.join(DATA_DIR, 'events', 'outbox', 'clean');
-    const tmpFiles = fs.readdirSync(outboxDir).filter((f) => f.endsWith('.tmp'));
+    const tmpFiles = fs
+      .readdirSync(outboxDir)
+      .filter((f) => f.endsWith('.tmp'));
     expect(tmpFiles).toHaveLength(0);
   });
 
@@ -105,7 +109,9 @@ describe('writeOutboxEvent', () => {
 
     const outboxDir = path.join(DATA_DIR, 'events', 'outbox', 'whatsapp');
     const files = fs.readdirSync(outboxDir).filter((f) => f.endsWith('.json'));
-    const written = JSON.parse(fs.readFileSync(path.join(outboxDir, files[0]), 'utf-8'));
+    const written = JSON.parse(
+      fs.readFileSync(path.join(outboxDir, files[0]), 'utf-8'),
+    );
     expect(written.type).toBe('typing');
     expect(written.isTyping).toBe(true);
   });

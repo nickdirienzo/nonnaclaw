@@ -401,7 +401,10 @@ async function startMessageLoop(): Promise<void> {
           if (!group) continue;
 
           if (!canSendToJid(chatJid)) {
-            logger.warn({ chatJid }, 'No channel or skill owns JID, skipping messages');
+            logger.warn(
+              { chatJid },
+              'No channel or skill owns JID, skipping messages',
+            );
             continue;
           }
 

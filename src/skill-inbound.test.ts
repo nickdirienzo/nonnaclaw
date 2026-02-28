@@ -45,8 +45,7 @@ describe('inbox event routing', () => {
 
     const deps = {
       resolveGroup: (channel: string, chatId: string) => {
-        if (channel === 'telegram' && chatId === 'chat123')
-          return 'tg:chat123';
+        if (channel === 'telegram' && chatId === 'chat123') return 'tg:chat123';
         return undefined;
       },
       storeAndNotify: (msg: {
@@ -71,10 +70,7 @@ describe('inbox event routing', () => {
       senderName: 'Alice',
       timestamp: new Date().toISOString(),
     };
-    fs.writeFileSync(
-      path.join(INBOX_DIR, '001.json'),
-      JSON.stringify(event),
-    );
+    fs.writeFileSync(path.join(INBOX_DIR, '001.json'), JSON.stringify(event));
 
     // Start with no skills (just the inbox poller)
     startInboundSchedulers([], deps);
@@ -123,10 +119,7 @@ describe('inbox event routing', () => {
       senderName: 'Alice',
       timestamp: new Date().toISOString(),
     };
-    fs.writeFileSync(
-      path.join(INBOX_DIR, 'skip.json'),
-      JSON.stringify(event),
-    );
+    fs.writeFileSync(path.join(INBOX_DIR, 'skip.json'), JSON.stringify(event));
 
     startInboundSchedulers([], deps);
     await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -163,10 +156,7 @@ describe('inbox event routing', () => {
       timestamp: new Date().toISOString(),
       messageId: 'custom-msg-id',
     };
-    fs.writeFileSync(
-      path.join(INBOX_DIR, 'dedup.json'),
-      JSON.stringify(event),
-    );
+    fs.writeFileSync(path.join(INBOX_DIR, 'dedup.json'), JSON.stringify(event));
 
     startInboundSchedulers([], deps);
     await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -207,10 +197,7 @@ describe('inbox event routing', () => {
       timestamp: new Date().toISOString(),
       metadata: { name: 'Family Chat', isGroup: true },
     };
-    fs.writeFileSync(
-      path.join(INBOX_DIR, 'meta.json'),
-      JSON.stringify(event),
-    );
+    fs.writeFileSync(path.join(INBOX_DIR, 'meta.json'), JSON.stringify(event));
 
     startInboundSchedulers([], deps);
     await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -283,10 +270,7 @@ describe('inbox event routing', () => {
       timestamp: new Date().toISOString(),
       metadata: { isBotMessage: true },
     };
-    fs.writeFileSync(
-      path.join(INBOX_DIR, 'bot.json'),
-      JSON.stringify(event),
-    );
+    fs.writeFileSync(path.join(INBOX_DIR, 'bot.json'), JSON.stringify(event));
 
     startInboundSchedulers([], deps);
     await new Promise((resolve) => setTimeout(resolve, 3000));

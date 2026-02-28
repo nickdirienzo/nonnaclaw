@@ -2,7 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-import { loadSkills, collectMcpServers, resolveSkillForJid } from './skill-registry.js';
+import {
+  loadSkills,
+  collectMcpServers,
+  resolveSkillForJid,
+} from './skill-registry.js';
 import { LoadedSkill } from './types.js';
 
 // Mock dependencies
@@ -357,7 +361,9 @@ describe('resolveSkillForJid', () => {
   });
 
   it('matches suffix pattern *@s.whatsapp.net', () => {
-    expect(resolveSkillForJid(skills, '5551234@s.whatsapp.net')).toBe('whatsapp');
+    expect(resolveSkillForJid(skills, '5551234@s.whatsapp.net')).toBe(
+      'whatsapp',
+    );
   });
 
   it('matches suffix pattern *@lid', () => {
