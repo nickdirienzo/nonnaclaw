@@ -20,6 +20,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 
 import {
@@ -30,6 +31,17 @@ import {
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import type { InboxEvent, LoadedSkill } from './types.js';
+
+export interface ToolRule {
+  allow: boolean;
+  pinnedParams?: Record<string, string>;
+}
+
+interface GroupScope {
+  rules: Record<string, ToolRule>;
+  mcpServer: Server;
+  httpTransport: StreamableHTTPServerTransport;
+}
 
 /**
  * Return an ISO-8601-ish string in local time with UTC offset,
@@ -57,6 +69,7 @@ interface BridgeEntry {
   port: number;
   upstream: Client;
   upstreamTransport: StdioClientTransport;
+  upstreamTools: Tool[];
   mcpServer: Server;
   httpTransport: StreamableHTTPServerTransport;
   httpServer: http.Server;
@@ -64,6 +77,7 @@ interface BridgeEntry {
   pollTimer?: ReturnType<typeof setInterval>;
   healthTimer?: ReturnType<typeof setInterval>;
   healthy: boolean;
+  groupScopes: Map<string, GroupScope>;
 }
 
 const bridges = new Map<string, BridgeEntry>();
@@ -107,6 +121,22 @@ export async function stopMcpBridges(): Promise<void> {
 
     if (entry.pollTimer) clearInterval(entry.pollTimer);
     if (entry.healthTimer) clearInterval(entry.healthTimer);
+
+    // Close all group scopes first
+    for (const [groupName, scope] of entry.groupScopes) {
+      try {
+        await scope.httpTransport.close();
+      } catch {
+        /* best effort */
+      }
+      try {
+        await scope.mcpServer.close();
+      } catch {
+        /* best effort */
+      }
+      logger.debug({ skill: name, group: groupName }, 'Group scope closed');
+    }
+    entry.groupScopes.clear();
 
     try {
       entry.httpServer.close();
@@ -165,6 +195,132 @@ export async function callBridgeTool(
   }
 }
 
+/**
+ * Create a filtered MCP scope that enforces tool allowlists and pinned params.
+ * Returns handlers that filter ListTools and validate/pin CallTool requests.
+ */
+export function createFilteredScope(
+  upstreamTools: Tool[],
+  upstream: Client,
+  rules: Record<string, ToolRule>,
+): GroupScope {
+  const mcpServer = new Server(
+    { name: 'nonnaclaw-scope', version: '1.0.0' },
+    { capabilities: { tools: {} } },
+  );
+
+  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
+    const tools = upstreamTools
+      .filter((tool) => rules[tool.name]?.allow === true)
+      .map((tool) => {
+        const pinnedKeys = new Set(
+          Object.keys(rules[tool.name]?.pinnedParams || {}),
+        );
+        if (pinnedKeys.size === 0) return tool;
+
+        // Remove pinned params from schema so agent doesn't see them
+        const schema = {
+          ...(tool.inputSchema || { type: 'object' as const }),
+        } as {
+          type: string;
+          properties?: Record<string, unknown>;
+          required?: string[];
+        };
+
+        if (schema.properties) {
+          const props = { ...schema.properties };
+          for (const key of pinnedKeys) delete props[key];
+          schema.properties = props;
+        }
+
+        if (schema.required) {
+          schema.required = schema.required.filter((r) => !pinnedKeys.has(r));
+        }
+
+        return { ...tool, inputSchema: schema };
+      });
+
+    return { tools };
+  });
+
+  mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const rule = rules[name];
+
+    if (!rule?.allow) {
+      return {
+        content: [
+          { type: 'text' as const, text: `Tool "${name}" is not allowed.` },
+        ],
+        isError: true,
+      };
+    }
+
+    // Pinned params override anything the agent provides
+    const mergedArgs = {
+      ...(args || {}),
+      ...(rule.pinnedParams || {}),
+    };
+
+    return await upstream.callTool({ name, arguments: mergedArgs });
+  });
+
+  const httpTransport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined, // stateless
+  });
+
+  // Connect synchronously — transport is ready after this
+  void mcpServer.connect(httpTransport);
+
+  return { rules, mcpServer, httpTransport };
+}
+
+/**
+ * Register a per-group filtered scope for a skill's MCP bridge.
+ * The scope enforces tool allowlists and pinned params on the host side.
+ * If re-registering the same group, the old scope is closed first.
+ */
+export async function registerGroupScope(
+  skillName: string,
+  groupName: string,
+  rules: Record<string, ToolRule>,
+): Promise<void> {
+  const entry = bridges.get(skillName);
+  if (!entry) {
+    throw new Error(`No MCP bridge running for skill "${skillName}"`);
+  }
+
+  // Close old scope if re-registering
+  const existing = entry.groupScopes.get(groupName);
+  if (existing) {
+    try {
+      await existing.httpTransport.close();
+    } catch {
+      /* best effort */
+    }
+    try {
+      await existing.mcpServer.close();
+    } catch {
+      /* best effort */
+    }
+    entry.groupScopes.delete(groupName);
+  }
+
+  const scope = createFilteredScope(entry.upstreamTools, entry.upstream, rules);
+  entry.groupScopes.set(groupName, scope);
+
+  logger.debug(
+    {
+      skill: skillName,
+      group: groupName,
+      allowedTools: Object.entries(rules)
+        .filter(([, r]) => r.allow)
+        .map(([name]) => name),
+    },
+    'Registered group scope',
+  );
+}
+
 async function startBridge(
   skill: LoadedSkill,
   port: number,
@@ -194,14 +350,14 @@ async function startBridge(
 
   await upstream.connect(upstreamTransport);
 
-  // Cache upstream tool list
+  // Cache upstream tool list (used by unscoped bridge AND per-group scopes)
   const { tools: upstreamTools } = await upstream.listTools();
   logger.debug(
     { skill: name, toolCount: upstreamTools.length },
     'Upstream MCP tools discovered',
   );
 
-  // 2. Create forwarding MCP server (no filtering — scoping in container proxy)
+  // 2. Create forwarding MCP server (unscoped — used by callBridgeTool on host)
   const mcpServer = new Server(
     { name: `nonnaclaw-bridge-${name}`, version: '1.0.0' },
     { capabilities: { tools: {} } },
@@ -223,6 +379,9 @@ async function startBridge(
 
   await mcpServer.connect(httpTransport);
 
+  // Group scopes map — populated later by registerGroupScope()
+  const groupScopes = new Map<string, GroupScope>();
+
   const httpServer = http.createServer(async (req, res) => {
     // CORS headers for container access
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -239,7 +398,23 @@ async function startBridge(
     }
 
     try {
-      await httpTransport.handleRequest(req, res);
+      // Route: /mcp/{groupName} → scoped transport, /mcp → unscoped
+      const url = new URL(req.url || '/', `http://localhost:${port}`);
+      const pathParts = url.pathname.split('/').filter(Boolean); // ["mcp", groupName?]
+
+      if (pathParts.length >= 2 && pathParts[0] === 'mcp') {
+        const groupName = pathParts[1];
+        const scope = groupScopes.get(groupName);
+        if (!scope) {
+          res.writeHead(404);
+          res.end(`No scope registered for group "${groupName}"`);
+          return;
+        }
+        await scope.httpTransport.handleRequest(req, res);
+      } else {
+        // /mcp or / — unscoped pass-through (used by callBridgeTool)
+        await httpTransport.handleRequest(req, res);
+      }
     } catch (err) {
       logger.error({ skill: name, err }, 'HTTP transport error');
       if (!res.headersSent) {
@@ -259,10 +434,12 @@ async function startBridge(
     port,
     upstream,
     upstreamTransport,
+    upstreamTools,
     mcpServer,
     httpTransport,
     httpServer,
     healthy: true,
+    groupScopes,
   };
 
   bridges.set(name, entry);

@@ -11,7 +11,7 @@ Single Node.js process that routes messages to Claude Agent SDK running in conta
 | File | Purpose |
 |------|---------|
 | `src/index.ts` | Orchestrator: state, message loop, agent invocation |
-| `src/mcp-bridge.ts` | Host-side MCP bridge: spawns servers, exposes HTTP, polls inbound |
+| `src/mcp-bridge.ts` | Host-side MCP bridge: spawns servers, exposes HTTP, polls inbound, per-group scope enforcement |
 | `src/ipc.ts` | IPC watcher and task processing |
 | `src/router.ts` | Message formatting and outbound routing |
 | `src/skill-registry.ts` | Discovers skills, generates proxy configs with scoping rules |

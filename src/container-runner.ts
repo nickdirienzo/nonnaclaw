@@ -30,8 +30,8 @@ import {
 } from './skill-registry.js';
 import { LoadedSkill, RegisteredGroup } from './types.js';
 
-/** Path to the compiled MCP proxy inside the container (after tsc) */
-const CONTAINER_MCP_PROXY_PATH = '/tmp/dist/mcp-proxy.js';
+/** Path to the compiled MCP forwarder inside the container (after tsc) */
+const CONTAINER_MCP_FORWARDER_PATH = '/tmp/dist/mcp-forwarder.js';
 
 // Module-level state for loaded skills (set by orchestrator on startup)
 let loadedSkills: LoadedSkill[] = [];
@@ -319,7 +319,7 @@ export async function runContainerAgent(
     const proxied = collectProxiedMcpServers(
       loadedSkills,
       group,
-      CONTAINER_MCP_PROXY_PATH,
+      CONTAINER_MCP_FORWARDER_PATH,
     );
     if (Object.keys(proxied).length > 0) {
       input.additionalMcpServers = proxied;

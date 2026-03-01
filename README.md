@@ -69,6 +69,9 @@ nonnaclaw-skills/whatsapp/               nonnaclaw-skills/telegram/
 |  | - StdioClientTransport  |  | - StdioClientTransport   |   |
 |  | - HTTP endpoint :19700  |  | - HTTP endpoint :19701   |   |
 |  | - Polls list_messages   |  | - Polls getUpdates       |   |
+|  | - Per-group scopes:     |  | - Per-group scopes:      |   |
+|  |   /mcp/family → filtered|  |   /mcp/work → filtered   |   |
+|  |   /mcp/work → filtered  |  |                          |   |
 |  +-------------------------+  +-------------------------+    |
 |                                                              |
 |  Orchestrator (src/index.ts)                                 |
@@ -76,22 +79,22 @@ nonnaclaw-skills/whatsapp/               nonnaclaw-skills/telegram/
 |  - IPC watcher, task scheduler, KV store                     |
 |  - Nonna at the pass: routes inbound, dispatches outbound    |
 +----------------------------+---------------------------------+
-                             | HTTP (host.docker.internal:PORT)
+                             | HTTP (host.docker.internal:PORT/mcp/{group})
                              v
 +-- Agent Container -----------------------------------------------+
-|  MCP Proxy (mcp-proxy.ts)                                        |
-|  - Connects to host bridge via StreamableHTTPClientTransport     |
-|  - Applies scopeTemplate: tool allowlists + param pinning        |
-|  - Agent only sees tools it's authorized for                     |
+|  MCP Forwarder (mcp-forwarder.ts)                                |
+|  - Dumb stdio-to-HTTP adapter (zero filtering)                   |
+|  - Scope enforcement is on the HOST, not here                    |
+|  - Agent only sees tools the host-side scope allows              |
 |                                                                  |
-|  NonnaClaw MCP (ipc-mcp-stdio.ts)                                 |
+|  NonnaClaw MCP (ipc-mcp-stdio.ts)                                |
 |  - send_message, schedule_task, save_state, etc.                 |
 |                                                                  |
 |  Claude Agent SDK                                                |
 +------------------------------------------------------------------+
 ```
 
-Single Node.js process on the host. MCP servers run as child processes with stdio transport. The host bridges each one to an HTTP endpoint. Container agents connect through a scoping proxy that enforces per-group authorization. Agents execute in isolated Linux containers (Apple Container or Docker) with only their group's filesystem mounted.
+Single Node.js process on the host. MCP servers run as child processes with stdio transport. The host bridges each one to an HTTP endpoint with per-group filtered scopes. Each group gets its own URL path (`/mcp/{groupName}`) that enforces tool allowlists and parameter pinning — the agent never sees tools it isn't authorized for, and pinned parameters (like chat IDs) can't be overridden. The container side is a dumb forwarder with zero filtering logic, so a compromised agent can't bypass scope enforcement. Agents execute in isolated Linux containers (Apple Container or Docker) with only their group's filesystem mounted.
 
 ## Skill Anatomy
 
@@ -138,6 +141,7 @@ The skill never touches core source files. It only configures itself and registe
 | **MCP bridge polls inbound** | The host's MCP bridge uses `pollTool` to pull new messages generically. Each skill just declares what to poll. No per-skill inbound scripts. |
 | **Inbound on host, outbound via host** | If the agent runs its own inbound listener, a compromised agent can forge or filter incoming messages. Outbound goes through the host bridge too — Nonna sees everything that comes in and goes out. |
 | **MCP auth broker on host** | The host holds credentials and proxies tool calls. The agent never sees raw tokens. |
+| **Scope enforcement on host** | Tool allowlists and pinned params are enforced on the host, not in the container. The container runs a dumb forwarder — a compromised agent can't modify, kill, or bypass the filtering logic. |
 | **Community MCP servers for outbound** | Writing NonnaClaw-specific MCP servers defeats the purpose. Use what exists. |
 
 ## Quick Start
@@ -186,14 +190,14 @@ Added by NonnaClaw:
 | File | Purpose |
 |------|---------|
 | `src/index.ts` | Orchestrator: state, message loop, agent invocation |
-| `src/mcp-bridge.ts` | Host-side MCP bridge: spawns servers, exposes HTTP, polls inbound |
+| `src/mcp-bridge.ts` | Host-side MCP bridge: spawns servers, exposes HTTP, polls inbound, per-group scope enforcement |
 | `src/ipc.ts` | IPC watcher and task processing |
 | `src/router.ts` | Message formatting and outbound routing |
 | `src/skill-registry.ts` | Discovers skills, generates proxy configs with scoping rules |
 | `src/container-runner.ts` | Spawns agent containers with mounts |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
 | `src/db.ts` | SQLite operations |
-| `container/agent-runner/src/mcp-proxy.ts` | In-container proxy: HTTP upstream + scope enforcement |
+| `container/agent-runner/src/mcp-forwarder.ts` | In-container forwarder: dumb stdio-to-HTTP adapter (no filtering) |
 | `../nonnaclaw-skills/*/skill.json` | Skill manifests (sibling directory) |
 | `groups/*/CLAUDE.md` | Per-group agent memory |
 

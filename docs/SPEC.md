@@ -121,7 +121,8 @@ nonnaclaw/
 │   │   ├── tsconfig.json
 │   │   └── src/
 │   │       ├── index.ts           # Entry point (query loop, IPC polling, session resume)
-│   │       └── ipc-mcp-stdio.ts   # Stdio-based MCP server for host communication
+│   │       ├── ipc-mcp-stdio.ts   # Stdio-based MCP server for host communication
+│   │       └── mcp-forwarder.ts   # Dumb stdio-to-HTTP adapter (scope enforcement on host)
 │   └── skills/
 │       └── agent-browser.md       # Browser automation skill
 │

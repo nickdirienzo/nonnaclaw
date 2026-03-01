@@ -4,7 +4,7 @@ import path from 'path';
 import { SKILLS_DIR } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
-import { getBridgePort } from './mcp-bridge.js';
+import { getBridgePort, registerGroupScope } from './mcp-bridge.js';
 import {
   LoadedSkill,
   RegisteredGroup,
@@ -138,17 +138,18 @@ export function resolveSkillForJid(
 /**
  * Build proxied MCP server configs for a group.
  *
- * For skills with a `mcp` field and `scopeTemplate`, wraps the MCP server
- * with the proxy, applying per-group scoping rules from `authorizedSkills`.
+ * For skills with a `mcp` field and `scopeTemplate`, registers a host-side
+ * filtered scope on the MCP bridge and returns a forwarder config that
+ * connects the container to the scoped endpoint.
  *
  * Falls back to legacy `collectMcpServers` for skills using `mcpServers` field.
  *
- * @param mcpProxyPath - absolute path to the compiled mcp-proxy.js inside the container
+ * @param mcpForwarderPath - absolute path to the compiled mcp-forwarder.js inside the container
  */
 export function collectProxiedMcpServers(
   skills: LoadedSkill[],
   group: RegisteredGroup,
-  mcpProxyPath: string,
+  mcpForwarderPath: string,
 ): Record<
   string,
   { command: string; args?: string[]; env?: Record<string, string> }
@@ -164,45 +165,30 @@ export function collectProxiedMcpServers(
       const skill = skills.find((s) => s.manifest.name === skillName);
       if (!skill?.manifest.mcp) continue;
 
+      const bridgePort = getBridgePort(skillName);
+      if (!bridgePort) {
+        logger.error(
+          { skill: skillName, group: group.folder },
+          'No MCP bridge running for skill — skipping (host-side enforcement required)',
+        );
+        continue;
+      }
+
       const rules = buildProxyRules(skill.manifest, scope);
 
-      // If a host-side MCP bridge is running for this skill, connect via HTTP.
-      // Otherwise, fall back to spawning the upstream MCP server in the container.
-      const bridgePort = getBridgePort(skillName);
-      let proxyConfig;
-
-      if (bridgePort) {
-        proxyConfig = {
-          upstream: {
-            url: `http://host.docker.internal:${bridgePort}/mcp`,
-          },
-          rules,
-        };
-      } else {
-        // Resolve env vars for the upstream MCP server
-        let upstreamEnv: Record<string, string> | undefined;
-        if (
-          skill.manifest.mcp.envKeys &&
-          skill.manifest.mcp.envKeys.length > 0
-        ) {
-          upstreamEnv = readEnvFile(skill.manifest.mcp.envKeys);
-        }
-
-        proxyConfig = {
-          upstream: {
-            command: skill.manifest.mcp.command,
-            args: skill.manifest.mcp.args,
-            env: upstreamEnv,
-          },
-          rules,
-        };
-      }
+      // Register host-side filtered scope (fire-and-forget — bridge is already running)
+      registerGroupScope(skillName, group.folder, rules).catch((err) => {
+        logger.error(
+          { skill: skillName, group: group.folder, err },
+          'Failed to register group scope',
+        );
+      });
 
       result[skillName] = {
         command: 'node',
-        args: [mcpProxyPath],
+        args: [mcpForwarderPath],
         env: {
-          MCP_PROXY_CONFIG: JSON.stringify(proxyConfig),
+          MCP_UPSTREAM_URL: `http://host.docker.internal:${bridgePort}/mcp/${group.folder}`,
         },
       };
     }

@@ -64,7 +64,26 @@ Messages and task operations are verified against group identity:
 | View all tasks | ✓ | Own only |
 | Manage other groups | ✓ | ✗ |
 
-### 5. Credential Handling
+### 5. MCP Scope Enforcement (Host-Side)
+
+MCP tool access is scoped per-group on the **host**, outside the container sandbox. This is a deliberate security boundary: the agent cannot modify, kill, or bypass the filtering logic because it runs in a different process that the agent has zero access to.
+
+**How it works:**
+
+Each skill's MCP bridge (`src/mcp-bridge.ts`) registers per-group filtered scopes via `registerGroupScope()`. Each group gets its own HTTP path (`/mcp/{groupName}`) that:
+
+1. **Filters `tools/list`** — only tools with `allow: true` in the group's rules are returned
+2. **Hides pinned params** — pinned parameter names are stripped from tool schemas so the agent doesn't know they exist
+3. **Validates `tools/call`** — calls to disallowed tools are rejected with an error
+4. **Injects pinned params** — pinned values (e.g., `chat_id`) are merged into every call, overriding anything the agent provides
+
+**Container side is intentionally dumb:**
+
+The container runs `mcp-forwarder.ts`, a ~50-line stdio-to-HTTP adapter with zero filtering. It reads `MCP_UPSTREAM_URL` (pointing to the host's scoped endpoint), caches the tool list, and forwards calls as-is. All security decisions are made by the host before the response reaches the agent.
+
+**If no bridge is running for a skill, the agent gets no MCP tools for that skill.** There is no fallback to container-side filtering.
+
+### 6. Credential Handling
 
 **Mounted Credentials:**
 - Claude auth tokens (filtered from `.env`, read-only)
@@ -91,7 +110,7 @@ const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
 | Global memory | Implicit via project | `/workspace/global` (ro) |
 | Additional mounts | Configurable | Read-only unless allowed |
 | Network access | Unrestricted | Unrestricted |
-| MCP tools | All | All |
+| MCP tools | Per-group scoped (host-enforced) | Per-group scoped (host-enforced) |
 
 ## Security Architecture Diagram
 
@@ -109,15 +128,19 @@ const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
 │  • Mount validation (external allowlist)                          │
 │  • Container lifecycle                                            │
 │  • Credential filtering                                           │
+│  • MCP scope enforcement (tool allowlists, pinned params)         │
+│    ↳ Per-group filtered scopes at /mcp/{groupName}                │
+│    ↳ Agent never sees disallowed tools or pinned param names      │
 └────────────────────────────────┬─────────────────────────────────┘
                                  │
-                                 ▼ Explicit mounts only
+                                 ▼ Explicit mounts + filtered MCP
 ┌──────────────────────────────────────────────────────────────────┐
 │                CONTAINER (ISOLATED/SANDBOXED)                     │
 │  • Agent execution                                                │
 │  • Bash commands (sandboxed)                                      │
 │  • File operations (limited to mounts)                            │
+│  • MCP forwarder (dumb adapter, zero filtering)                   │
 │  • Network access (unrestricted)                                  │
-│  • Cannot modify security config                                  │
+│  • Cannot modify security config or scope enforcement             │
 └──────────────────────────────────────────────────────────────────┘
 ```

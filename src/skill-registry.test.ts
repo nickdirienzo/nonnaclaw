@@ -5,9 +5,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   loadSkills,
   collectMcpServers,
+  collectProxiedMcpServers,
   resolveSkillForJid,
 } from './skill-registry.js';
-import { LoadedSkill } from './types.js';
+import { LoadedSkill, RegisteredGroup } from './types.js';
+import { logger } from './logger.js';
 
 // Mock dependencies
 vi.mock('./logger.js', () => ({
@@ -31,6 +33,17 @@ vi.mock('./env.js', () => ({
     }
     return result;
   }),
+}));
+
+const mockRegisterGroupScope = vi.fn<
+  (skill: string, group: string, rules: unknown) => Promise<void>
+>(async () => {});
+const mockGetBridgePort = vi.fn<(name: string) => number | undefined>();
+
+vi.mock('./mcp-bridge.js', () => ({
+  getBridgePort: (name: string) => mockGetBridgePort(name),
+  registerGroupScope: (skill: string, group: string, rules: unknown) =>
+    mockRegisterGroupScope(skill, group, rules),
 }));
 
 const SKILLS_DIR = '/tmp/nonnaclaw-test-skills';
@@ -269,5 +282,108 @@ describe('resolveSkillForJid', () => {
 
   it('returns undefined for empty skills array', () => {
     expect(resolveSkillForJid([], '12345@g.us')).toBeUndefined();
+  });
+});
+
+describe('collectProxiedMcpServers', () => {
+  const FORWARDER_PATH = '/tmp/dist/mcp-forwarder.js';
+
+  const skills: LoadedSkill[] = [
+    {
+      manifest: {
+        name: 'whatsapp',
+        version: '1.0.0',
+        mcp: { command: 'uv', args: ['run', 'main.py'] },
+        scopeTemplate: {
+          send_message: { allow: true, scopedParams: ['chat_id'] },
+          list_messages: { allow: true },
+        },
+      },
+      dir: '/skills/whatsapp',
+    },
+    {
+      manifest: {
+        name: 'no-mcp',
+        version: '1.0.0',
+      },
+      dir: '/skills/no-mcp',
+    },
+  ];
+
+  const group: RegisteredGroup = {
+    name: 'Test Group',
+    folder: 'test-group',
+    trigger: '@Andy',
+    added_at: '2026-01-01',
+    authorizedSkills: {
+      whatsapp: {
+        pinnedParams: {
+          'send_message.chat_id': '12345@g.us',
+        },
+      },
+    },
+  };
+
+  beforeEach(() => {
+    mockRegisterGroupScope.mockClear();
+    mockGetBridgePort.mockReset();
+    vi.mocked(logger.error).mockClear();
+  });
+
+  it('with bridge: calls registerGroupScope and returns forwarder config', () => {
+    mockGetBridgePort.mockReturnValue(19700);
+
+    const result = collectProxiedMcpServers(skills, group, FORWARDER_PATH);
+
+    expect(mockRegisterGroupScope).toHaveBeenCalledWith(
+      'whatsapp',
+      'test-group',
+      expect.objectContaining({
+        send_message: {
+          allow: true,
+          pinnedParams: { chat_id: '12345@g.us' },
+        },
+        list_messages: { allow: true },
+      }),
+    );
+
+    expect(result.whatsapp).toBeDefined();
+    expect(result.whatsapp.command).toBe('node');
+    expect(result.whatsapp.args).toEqual([FORWARDER_PATH]);
+    expect(result.whatsapp.env).toEqual({
+      MCP_UPSTREAM_URL:
+        'http://host.docker.internal:19700/mcp/test-group',
+    });
+  });
+
+  it('without bridge: skips skill and logs error', () => {
+    mockGetBridgePort.mockReturnValue(undefined);
+
+    const result = collectProxiedMcpServers(skills, group, FORWARDER_PATH);
+
+    expect(Object.keys(result)).toHaveLength(0);
+    expect(mockRegisterGroupScope).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ skill: 'whatsapp', group: 'test-group' }),
+      expect.stringContaining('No MCP bridge running'),
+    );
+  });
+
+  it('skips skills without mcp config even if authorized', () => {
+    mockGetBridgePort.mockReturnValue(19700);
+
+    const groupWithNoMcp: RegisteredGroup = {
+      ...group,
+      authorizedSkills: {
+        'no-mcp': {},
+      },
+    };
+
+    const result = collectProxiedMcpServers(
+      skills,
+      groupWithNoMcp,
+      FORWARDER_PATH,
+    );
+    expect(Object.keys(result)).toHaveLength(0);
   });
 });
