@@ -171,7 +171,7 @@ Claude clones the repo, reads `SKILL.md`, walks you through auth, registers your
 
 ## Ancestry
 
-Nonnaclaw is a fork of [NanoClaw](https://github.com/qwibitai/NanoClaw) by [Gavriel Cohen](https://github.com/gavrielco) and wouldn't exist without it. NanoClaw's core insight is that a personal AI assistant should be small enough to understand, secure by isolation, and customizable by rewriting code. That's the foundation everything here builds on. The container model, filesystem IPC, per-group isolation, the Claude Agent SDK harness, the entire runtime: all NanoClaw.
+Nonnaclaw is a fork of [NanoClaw](https://github.com/qwibitai/NanoClaw) by [Gavriel Cohen](https://github.com/gavrielc) and wouldn't exist without it. NanoClaw's core insight is that a personal AI assistant should be small enough to understand, secure by isolation, and customizable by rewriting code. That's the foundation everything here builds on. The container model, filesystem IPC, per-group isolation, the Claude Agent SDK harness, the entire runtime: all NanoClaw.
 
 What Nonnaclaw changes is narrow: how skills are packaged and how channels are added. NanoClaw's "skills as codemods" model is elegant and works well for a single-user fork. Nonnaclaw experiments with an alternative. Skills as self-contained MCP packages that never touch core, aimed at making it possible to compose multiple community-maintained skills without merge conflicts.
 
