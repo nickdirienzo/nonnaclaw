@@ -151,19 +151,30 @@ export function collectMcpServers(
 }
 
 /**
- * Match a JID against loaded skills' outbound.jidPatterns.
+ * Match a JID against loaded skills' outbound.jidPatterns or MCP send capability.
  * Returns the skill name that handles outbound for this JID, or undefined.
+ *
+ * Priority:
+ * 1. Skills with explicit outbound.jidPatterns (pattern match)
+ * 2. MCP skills with send_message in scopeTemplate (catch-all for MCP channels)
  */
 export function resolveSkillForJid(
   skills: LoadedSkill[],
   jid: string,
 ): string | undefined {
+  // First: check explicit outbound patterns
   for (const skill of skills) {
     if (!skill.manifest.outbound?.jidPatterns) continue;
     for (const pattern of skill.manifest.outbound.jidPatterns) {
       if (matchJidPattern(pattern, jid)) {
         return skill.manifest.name;
       }
+    }
+  }
+  // Fallback: MCP skills with send_message capability
+  for (const skill of skills) {
+    if (skill.manifest.mcp && skill.manifest.scopeTemplate?.send_message?.allow) {
+      return skill.manifest.name;
     }
   }
   return undefined;

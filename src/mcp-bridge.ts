@@ -31,6 +31,27 @@ import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import type { InboxEvent, LoadedSkill } from './types.js';
 
+/**
+ * Return an ISO-8601-ish string in local time with UTC offset,
+ * e.g. "2026-02-28 22:09:45-08:00". Matches the format many
+ * SQLite-backed MCP servers use for timestamp storage/comparison.
+ */
+function localISOString(date?: Date): string {
+  const d = date ?? new Date();
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const pad = (n: number) => String(Math.abs(n)).padStart(2, '0');
+  const hh = pad(Math.floor(Math.abs(off) / 60));
+  const mm = pad(Math.abs(off) % 60);
+  const yyyy = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const h = String(d.getHours()).padStart(2, '0');
+  const m = String(d.getMinutes()).padStart(2, '0');
+  const s = String(d.getSeconds()).padStart(2, '0');
+  return `${yyyy}-${mo}-${dd} ${h}:${m}:${s}${sign}${hh}:${mm}`;
+}
+
 interface BridgeEntry {
   skillName: string;
   port: number;
@@ -118,6 +139,27 @@ export async function stopMcpBridges(): Promise<void> {
  */
 export function getBridgePort(skillName: string): number | undefined {
   return bridges.get(skillName)?.port;
+}
+
+/**
+ * Call a tool on a running MCP bridge's upstream server.
+ * Used by the orchestrator to send messages via MCP skills (e.g., send_message).
+ */
+export async function callBridgeTool(
+  skillName: string,
+  toolName: string,
+  args: Record<string, unknown>,
+): Promise<boolean> {
+  const entry = bridges.get(skillName);
+  if (!entry || !entry.healthy) return false;
+
+  try {
+    await entry.upstream.callTool({ name: toolName, arguments: args });
+    return true;
+  } catch (err) {
+    logger.error({ skill: skillName, tool: toolName, err }, 'callBridgeTool failed');
+    return false;
+  }
 }
 
 async function startBridge(
@@ -225,7 +267,12 @@ async function startBridge(
   // 4. Start inbound polling if configured
   if (mcp.pollTool && onInboxEvent) {
     const interval = mcp.pollIntervalMs ?? MCP_DEFAULT_POLL_INTERVAL;
-    let lastPollTimestamp: string | undefined;
+    // Start from "now" so we don't replay historical messages on restart.
+    // Use local ISO format to match what the upstream DB stores (SQLite
+    // compares timestamps as strings, so timezone-offset representation
+    // must be consistent — UTC "2026-03-01T06:..." sorts after local
+    // "2026-02-28 22:..." even when they represent the same instant).
+    let lastPollTimestamp: string | undefined = localISOString();
 
     entry.pollTimer = setInterval(async () => {
       try {

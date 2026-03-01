@@ -5,7 +5,6 @@ import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
-  POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
 import {
@@ -21,64 +20,71 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
-  getAllChats,
   getAllKvStateForGroup,
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
   getChannelMapping,
-  getMessagesSince,
-  getNewMessages,
-  getRouterState,
   initDatabase,
   setRegisteredGroup,
-  setRouterState,
   setSession,
-  storeChatMetadata,
-  storeMessageDirect,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { formatMessages, formatOutbound } from './router.js';
 import { writeOutboxEvent } from './outbox.js';
-import {
-  startInboundSchedulers,
-  stopInboundSchedulers,
-} from './skill-inbound.js';
 import { loadSkills, resolveSkillForJid } from './skill-registry.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { startMcpBridges, stopMcpBridges } from './mcp-bridge.js';
+import { callBridgeTool, startMcpBridges, stopMcpBridges } from './mcp-bridge.js';
 import { LoadedSkill, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
 
-let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
-let lastAgentTimestamp: Record<string, string> = {};
-let messageLoopRunning = false;
 
 const queue = new GroupQueue();
 let skills: LoadedSkill[] = [];
 
 /**
- * Send a message to a JID via the skill outbox.
+ * In-memory message buffer. Accumulates messages per group between dispatch
+ * cycles. Drained by processGroupMessages when a container spins up.
+ */
+const pendingMessages = new Map<string, NewMessage[]>();
+
+/**
+ * Send a message to a JID via the MCP bridge or skill outbox.
+ * MCP skills with send_message are called directly via the bridge.
+ * Legacy handler-based skills use the file-based outbox.
  */
 async function sendToJid(jid: string, text: string): Promise<void> {
   const skillName = resolveSkillForJid(skills, jid);
-  if (skillName) {
-    writeOutboxEvent(skillName, {
-      type: 'message',
-      jid,
-      text,
-      timestamp: new Date().toISOString(),
-    });
+  if (!skillName) {
+    logger.warn({ jid }, 'No skill for JID, cannot send message');
     return;
   }
-  logger.warn({ jid }, 'No skill for JID, cannot send message');
+
+  // Try MCP bridge first (for MCP-based skills like WhatsApp)
+  const skill = skills.find((s) => s.manifest.name === skillName);
+  if (skill?.manifest.mcp && skill.manifest.scopeTemplate?.send_message) {
+    const sent = await callBridgeTool(skillName, 'send_message', {
+      recipient: jid,
+      message: text,
+    });
+    if (sent) return;
+    logger.warn({ jid, skillName }, 'MCP bridge send failed, trying outbox fallback');
+  }
+
+  // Fallback: file-based outbox for handler-based skills
+  writeOutboxEvent(skillName, {
+    type: 'message',
+    jid,
+    text,
+    timestamp: new Date().toISOString(),
+  });
 }
 
 /**
@@ -89,25 +95,12 @@ function canSendToJid(jid: string): boolean {
 }
 
 function loadState(): void {
-  lastTimestamp = getRouterState('last_timestamp') || '';
-  const agentTs = getRouterState('last_agent_timestamp');
-  try {
-    lastAgentTimestamp = agentTs ? JSON.parse(agentTs) : {};
-  } catch {
-    logger.warn('Corrupted last_agent_timestamp in DB, resetting');
-    lastAgentTimestamp = {};
-  }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
   );
-}
-
-function saveState(): void {
-  setRouterState('last_timestamp', lastTimestamp);
-  setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -136,20 +129,15 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
 /**
  * Get available groups list for the agent.
- * Returns groups ordered by most recent activity.
+ * Returns registered groups (used by IPC refresh_groups handler).
  */
 export function getAvailableGroups(): import('./container-runner.js').AvailableGroup[] {
-  const chats = getAllChats();
-  const registeredJids = new Set(Object.keys(registeredGroups));
-
-  return chats
-    .filter((c) => c.jid !== '__group_sync__' && c.is_group)
-    .map((c) => ({
-      jid: c.jid,
-      name: c.name,
-      lastActivity: c.last_message_time,
-      isRegistered: registeredJids.has(c.jid),
-    }));
+  return Object.entries(registeredGroups).map(([jid, group]) => ({
+    jid,
+    name: group.name,
+    lastActivity: group.added_at,
+    isRegistered: true,
+  }));
 }
 
 /** @internal - exported for testing */
@@ -162,6 +150,7 @@ export function _setRegisteredGroups(
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
+ * Drains the in-memory pendingMessages buffer.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
   const group = registeredGroups[chatJid];
@@ -172,36 +161,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
+  // Drain buffered messages
+  const buffered = pendingMessages.get(chatJid);
+  if (!buffered || buffered.length === 0) return true;
+  const messages = buffered.splice(0);
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(
-    chatJid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
-
-  if (missedMessages.length === 0) return true;
-
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
-    const hasTrigger = missedMessages.some((m) =>
-      TRIGGER_PATTERN.test(m.content.trim()),
-    );
-    if (!hasTrigger) return true;
-  }
-
-  const prompt = formatMessages(missedMessages);
-
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
-  saveState();
+  const prompt = formatMessages(messages);
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    { group: group.name, messageCount: messages.length },
     'Processing messages',
   );
 
@@ -252,21 +220,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
+    // If we already sent output to the user, don't re-buffer —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
       logger.warn(
         { group: group.name },
-        'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
+        'Agent error after output was sent, skipping re-buffer to prevent duplicates',
       );
       return true;
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
-    saveState();
+    // Re-push messages so retries can re-process them
+    const existing = pendingMessages.get(chatJid) || [];
+    pendingMessages.set(chatJid, [...messages, ...existing]);
     logger.warn(
       { group: group.name },
-      'Agent error, rolled back message cursor for retry',
+      'Agent error, re-buffered messages for retry',
     );
     return false;
   }
@@ -359,120 +327,91 @@ async function runAgent(
   }
 }
 
-async function startMessageLoop(): Promise<void> {
-  if (messageLoopRunning) {
-    logger.debug('Message loop already running, skipping duplicate start');
-    return;
-  }
-  messageLoopRunning = true;
-
-  logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
-
-  while (true) {
-    try {
-      const jids = Object.keys(registeredGroups);
-      const { messages, newTimestamp } = getNewMessages(
-        jids,
-        lastTimestamp,
-        ASSISTANT_NAME,
-      );
-
-      if (messages.length > 0) {
-        logger.info({ count: messages.length }, 'New messages');
-
-        // Advance the "seen" cursor for all messages immediately
-        lastTimestamp = newTimestamp;
-        saveState();
-
-        // Deduplicate by group
-        const messagesByGroup = new Map<string, NewMessage[]>();
-        for (const msg of messages) {
-          const existing = messagesByGroup.get(msg.chat_jid);
-          if (existing) {
-            existing.push(msg);
-          } else {
-            messagesByGroup.set(msg.chat_jid, [msg]);
-          }
-        }
-
-        for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
-
-          if (!canSendToJid(chatJid)) {
-            logger.warn(
-              { chatJid },
-              'No channel or skill owns JID, skipping messages',
-            );
-            continue;
-          }
-
-          const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const hasTrigger = groupMessages.some((m) =>
-              TRIGGER_PATTERN.test(m.content.trim()),
-            );
-            if (!hasTrigger) continue;
-          }
-
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
-
-          if (queue.sendMessage(chatJid, formatted)) {
-            logger.debug(
-              { chatJid, count: messagesToSend.length },
-              'Piped messages to active container',
-            );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
-          } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
-          }
-        }
-      }
-    } catch (err) {
-      logger.error({ err }, 'Error in message loop');
-    }
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
-  }
-}
-
-/**
- * Startup recovery: check for unprocessed messages in registered groups.
- * Handles crash between advancing lastTimestamp and processing messages.
- */
-function recoverPendingMessages(): void {
-  for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
-    if (pending.length > 0) {
-      logger.info(
-        { group: group.name, pendingCount: pending.length },
-        'Recovery: found unprocessed messages',
-      );
-      queue.enqueueMessageCheck(chatJid);
-    }
-  }
-}
-
 function ensureContainerSystemRunning(): void {
   ensureContainerRuntimeRunning();
   cleanupOrphans();
+}
+
+/**
+ * Handle an inbound message event from the MCP bridge.
+ * Dispatches directly to the group queue — no intermediate DB table.
+ */
+function onInboxEvent(event: import('./types.js').InboxEvent): void {
+  const jid =
+    getChannelMapping(event.channel, event.chatId) ||
+    (event.chatId.includes('@') ? event.chatId : undefined);
+  if (!jid) return;
+
+  // Skip bot messages: agent responses are prefixed with "AssistantName:"
+  if (event.content.startsWith(`${ASSISTANT_NAME}:`)) {
+    logger.debug({ jid }, 'Skipping bot-prefixed message');
+    return;
+  }
+
+  // Bootstrap: auto-register first DM as main group when no groups exist
+  if (
+    Object.keys(registeredGroups).length === 0 &&
+    !event.metadata?.isGroup &&
+    !event.metadata?.isBotMessage
+  ) {
+    registerGroup(jid, {
+      name: 'Main',
+      folder: MAIN_GROUP_FOLDER,
+      trigger: ASSISTANT_NAME,
+      added_at: new Date().toISOString(),
+      requiresTrigger: false,
+    });
+    logger.info(
+      { jid },
+      'Bootstrap: auto-registered first DM as main group',
+    );
+  }
+
+  const group = registeredGroups[jid];
+  if (!group) return;
+
+  const messageId =
+    event.messageId ||
+    `mcp-${event.channel}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  const msg: NewMessage = {
+    id: messageId,
+    chat_jid: jid,
+    sender: event.sender,
+    sender_name: event.senderName,
+    content: event.content,
+    timestamp: event.timestamp,
+  };
+
+  // Buffer the message
+  const buffer = pendingMessages.get(jid);
+  if (buffer) {
+    buffer.push(msg);
+  } else {
+    pendingMessages.set(jid, [msg]);
+  }
+
+  // Dispatch
+  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
+
+  if (queue.sendMessage(jid, formatMessages([msg]))) {
+    // Active container received the message — clear it from the buffer
+    const buf = pendingMessages.get(jid);
+    if (buf) {
+      const idx = buf.indexOf(msg);
+      if (idx !== -1) buf.splice(idx, 1);
+    }
+    logger.debug({ jid }, 'Piped message to active container');
+  } else if (isMainGroup || group.requiresTrigger === false) {
+    // Main group or no-trigger group: always dispatch
+    queue.enqueueMessageCheck(jid);
+  } else {
+    // Non-main group with trigger required: check for trigger
+    if (TRIGGER_PATTERN.test(msg.content.trim())) {
+      queue.enqueueMessageCheck(jid);
+    }
+    // Otherwise: silently accumulate — buffer holds context for when trigger arrives
+  }
 }
 
 async function main(): Promise<void> {
@@ -490,34 +429,13 @@ async function main(): Promise<void> {
   if (mcpSkills.length > 0) {
     await startMcpBridges({
       skills: mcpSkills,
-      onInboxEvent: (event) => {
-        const jid =
-          getChannelMapping(event.channel, event.chatId) ||
-          (event.chatId.includes('@') ? event.chatId : undefined);
-        if (!jid) return;
-
-        const messageId =
-          event.messageId ||
-          `mcp-${event.channel}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-        storeMessageDirect({
-          id: messageId,
-          chat_jid: jid,
-          sender: event.sender,
-          sender_name: event.senderName,
-          content: event.content,
-          timestamp: event.timestamp,
-          is_from_me: false,
-          is_bot_message: event.metadata?.isBotMessage === true,
-        });
-      },
+      onInboxEvent,
     });
   }
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
-    stopInboundSchedulers();
     await stopMcpBridges();
     await queue.shutdown(10000);
     process.exit(0);
@@ -546,45 +464,9 @@ async function main(): Promise<void> {
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
   });
-  startInboundSchedulers(skills, {
-    resolveGroup: (channel, chatId) => {
-      const mapped = getChannelMapping(channel, chatId);
-      if (mapped) return mapped;
-      // If chatId looks like a JID (contains @), use it directly
-      if (chatId.includes('@')) return chatId;
-      return undefined;
-    },
-    storeAndNotify: (msg) => {
-      storeMessageDirect(msg);
-
-      // Bootstrap: auto-register first DM as main group when no groups exist
-      if (
-        Object.keys(registeredGroups).length === 0 &&
-        !msg.is_group &&
-        !msg.is_bot_message
-      ) {
-        registerGroup(msg.chat_jid, {
-          name: 'Main',
-          folder: MAIN_GROUP_FOLDER,
-          trigger: ASSISTANT_NAME,
-          added_at: new Date().toISOString(),
-          requiresTrigger: false,
-        });
-        logger.info(
-          { jid: msg.chat_jid },
-          'Bootstrap: auto-registered first DM as main group',
-        );
-      }
-    },
-    storeChatMetadata: (chatJid, timestamp, name, channel, isGroup) =>
-      storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
-  });
   queue.setProcessMessagesFn(processGroupMessages);
-  recoverPendingMessages();
-  startMessageLoop().catch((err) => {
-    logger.fatal({ err }, 'Message loop crashed unexpectedly');
-    process.exit(1);
-  });
+
+  logger.info(`NanoClaw running (trigger: @${ASSISTANT_NAME})`);
 }
 
 // Guard: only run when executed directly, not when imported by tests
