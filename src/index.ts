@@ -13,6 +13,7 @@ import {
   runContainerAgent,
   setLoadedSkills,
   writeGroupsSnapshot,
+  writeStateSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
@@ -21,6 +22,7 @@ import {
 } from './container-runtime.js';
 import {
   getAllChats,
+  getAllKvStateForGroup,
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
@@ -38,7 +40,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { formatMessages, formatOutbound } from './router.js';
 import { writeOutboxEvent } from './outbox.js';
 import {
   startInboundSchedulers,
@@ -46,7 +48,8 @@ import {
 } from './skill-inbound.js';
 import { loadSkills, resolveSkillForJid } from './skill-registry.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, LoadedSkill, NewMessage, RegisteredGroup } from './types.js';
+import { startMcpBridges, stopMcpBridges } from './mcp-bridge.js';
+import { LoadedSkill, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -58,19 +61,13 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
-const channels: Channel[] = [];
 const queue = new GroupQueue();
 let skills: LoadedSkill[] = [];
 
 /**
- * Send a message to a JID, routing through channels first, then skill outbox.
+ * Send a message to a JID via the skill outbox.
  */
 async function sendToJid(jid: string, text: string): Promise<void> {
-  const channel = findChannel(channels, jid);
-  if (channel) {
-    await channel.sendMessage(jid, text);
-    return;
-  }
   const skillName = resolveSkillForJid(skills, jid);
   if (skillName) {
     writeOutboxEvent(skillName, {
@@ -81,16 +78,14 @@ async function sendToJid(jid: string, text: string): Promise<void> {
     });
     return;
   }
-  logger.warn({ jid }, 'No channel or skill for JID, cannot send message');
+  logger.warn({ jid }, 'No skill for JID, cannot send message');
 }
 
 /**
- * Check if we can send to a JID (via channel or skill).
+ * Check if we can send to a JID (via skill).
  */
 function canSendToJid(jid: string): boolean {
-  if (findChannel(channels, jid)) return true;
-  if (resolveSkillForJid(skills, jid)) return true;
-  return false;
+  return !!resolveSkillForJid(skills, jid);
 }
 
 function loadState(): void {
@@ -313,6 +308,10 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
+  // Update KV state snapshot for container to read
+  const kvState = getAllKvStateForGroup(group.folder);
+  writeStateSnapshot(group.folder, kvState);
+
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
@@ -486,12 +485,41 @@ async function main(): Promise<void> {
   skills = loadSkills();
   setLoadedSkills(skills);
 
+  // Start MCP bridges for skills with persistent MCP servers
+  const mcpSkills = skills.filter((s) => s.manifest.mcp);
+  if (mcpSkills.length > 0) {
+    await startMcpBridges({
+      skills: mcpSkills,
+      onInboxEvent: (event) => {
+        const jid =
+          getChannelMapping(event.channel, event.chatId) ||
+          (event.chatId.includes('@') ? event.chatId : undefined);
+        if (!jid) return;
+
+        const messageId =
+          event.messageId ||
+          `mcp-${event.channel}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+        storeMessageDirect({
+          id: messageId,
+          chat_jid: jid,
+          sender: event.sender,
+          sender_name: event.senderName,
+          content: event.content,
+          timestamp: event.timestamp,
+          is_from_me: false,
+          is_bot_message: event.metadata?.isBotMessage === true,
+        });
+      },
+    });
+  }
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     stopInboundSchedulers();
+    await stopMcpBridges();
     await queue.shutdown(10000);
-    for (const ch of channels) await ch.disconnect();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -532,7 +560,7 @@ async function main(): Promise<void> {
       // Bootstrap: auto-register first DM as main group when no groups exist
       if (
         Object.keys(registeredGroups).length === 0 &&
-        !msg.chat_jid.endsWith('@g.us') &&
+        !msg.is_group &&
         !msg.is_bot_message
       ) {
         registerGroup(msg.chat_jid, {

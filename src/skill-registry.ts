@@ -3,7 +3,13 @@ import path from 'path';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
-import { LoadedSkill, SkillManifest } from './types.js';
+import { getBridgePort } from './mcp-bridge.js';
+import {
+  LoadedSkill,
+  RegisteredGroup,
+  SkillManifest,
+  SkillScope,
+} from './types.js';
 
 const DEFAULT_SKILLS_DIR = path.resolve(process.cwd(), 'skills');
 
@@ -92,8 +98,9 @@ export function loadSkills(skillsDir?: string): LoadedSkill[] {
       {
         name: manifest.name,
         version: manifest.version,
-        hasMcp: !!manifest.mcpServers,
+        hasMcp: !!manifest.mcp || !!manifest.mcpServers,
         hasInbound: !!manifest.inbound,
+        hasScopeTemplate: !!manifest.scopeTemplate,
       },
       'Skill loaded',
     );
@@ -172,4 +179,136 @@ function matchJidPattern(pattern: string, jid: string): boolean {
     return jid.startsWith(pattern.slice(0, -1));
   }
   return jid === pattern;
+}
+
+/**
+ * Build proxied MCP server configs for a group.
+ *
+ * For skills with a `mcp` field and `scopeTemplate`, wraps the MCP server
+ * with the proxy, applying per-group scoping rules from `authorizedSkills`.
+ *
+ * Falls back to legacy `collectMcpServers` for skills using `mcpServers` field.
+ *
+ * @param mcpProxyPath - absolute path to the compiled mcp-proxy.js inside the container
+ */
+export function collectProxiedMcpServers(
+  skills: LoadedSkill[],
+  group: RegisteredGroup,
+  mcpProxyPath: string,
+): Record<
+  string,
+  { command: string; args?: string[]; env?: Record<string, string> }
+> {
+  const result: Record<
+    string,
+    { command: string; args?: string[]; env?: Record<string, string> }
+  > = {};
+
+  // New-style: skills with `mcp` field, authorized via `authorizedSkills`
+  if (group.authorizedSkills) {
+    for (const [skillName, scope] of Object.entries(group.authorizedSkills)) {
+      const skill = skills.find((s) => s.manifest.name === skillName);
+      if (!skill?.manifest.mcp) continue;
+
+      const rules = buildProxyRules(skill.manifest, scope);
+
+      // If a host-side MCP bridge is running for this skill, connect via HTTP.
+      // Otherwise, fall back to spawning the upstream MCP server in the container.
+      const bridgePort = getBridgePort(skillName);
+      let proxyConfig;
+
+      if (bridgePort) {
+        proxyConfig = {
+          upstream: {
+            url: `http://host.docker.internal:${bridgePort}/mcp`,
+          },
+          rules,
+        };
+      } else {
+        // Resolve env vars for the upstream MCP server
+        let upstreamEnv: Record<string, string> | undefined;
+        if (
+          skill.manifest.mcp.envKeys &&
+          skill.manifest.mcp.envKeys.length > 0
+        ) {
+          upstreamEnv = readEnvFile(skill.manifest.mcp.envKeys);
+        }
+
+        proxyConfig = {
+          upstream: {
+            command: skill.manifest.mcp.command,
+            args: skill.manifest.mcp.args,
+            env: upstreamEnv,
+          },
+          rules,
+        };
+      }
+
+      result[skillName] = {
+        command: 'node',
+        args: [mcpProxyPath],
+        env: {
+          MCP_PROXY_CONFIG: JSON.stringify(proxyConfig),
+        },
+      };
+    }
+  }
+
+  // Legacy fallback: skills using `mcpServers` field, authorized via `authorizedMcpServers`
+  if (group.authorizedMcpServers && group.authorizedMcpServers.length > 0) {
+    const legacy = collectMcpServers(skills, group.authorizedMcpServers);
+    for (const [name, config] of Object.entries(legacy)) {
+      if (!result[name]) {
+        result[name] = config;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Build proxy rules from a skill's scopeTemplate + group's scoping config.
+ * The scopeTemplate declares which tools to expose and which params are sensitive.
+ * The group's SkillScope provides the actual pinned values.
+ */
+function buildProxyRules(
+  manifest: SkillManifest,
+  scope: SkillScope,
+): Record<string, { allow: boolean; pinnedParams?: Record<string, string> }> {
+  const rules: Record<
+    string,
+    { allow: boolean; pinnedParams?: Record<string, string> }
+  > = {};
+
+  if (!manifest.scopeTemplate) {
+    // No scope template — block everything (secure by default)
+    return rules;
+  }
+
+  for (const [toolName, templateRule] of Object.entries(
+    manifest.scopeTemplate,
+  )) {
+    const rule: { allow: boolean; pinnedParams?: Record<string, string> } = {
+      allow: templateRule.allow,
+    };
+
+    // Resolve scoped params from the group's pinned values
+    if (templateRule.scopedParams && scope.pinnedParams) {
+      const pinned: Record<string, string> = {};
+      for (const paramName of templateRule.scopedParams) {
+        const key = `${toolName}.${paramName}`;
+        if (scope.pinnedParams[key]) {
+          pinned[paramName] = scope.pinnedParams[key];
+        }
+      }
+      if (Object.keys(pinned).length > 0) {
+        rule.pinnedParams = pinned;
+      }
+    }
+
+    rules[toolName] = rule;
+  }
+
+  return rules;
 }

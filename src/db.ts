@@ -88,6 +88,13 @@ function createSchema(database: Database.Database): void {
       jid TEXT NOT NULL,
       PRIMARY KEY (channel, chat_id)
     );
+    CREATE TABLE IF NOT EXISTS kv_store (
+      group_folder TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (group_folder, key)
+    );
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -121,23 +128,19 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add authorized_skills column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN authorized_skills TEXT`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
   try {
     database.exec(`ALTER TABLE chats ADD COLUMN channel TEXT`);
     database.exec(`ALTER TABLE chats ADD COLUMN is_group INTEGER DEFAULT 0`);
-    // Backfill from JID patterns
-    database.exec(
-      `UPDATE chats SET channel = 'whatsapp', is_group = 1 WHERE jid LIKE '%@g.us'`,
-    );
-    database.exec(
-      `UPDATE chats SET channel = 'whatsapp', is_group = 0 WHERE jid LIKE '%@s.whatsapp.net'`,
-    );
-    database.exec(
-      `UPDATE chats SET channel = 'discord', is_group = 1 WHERE jid LIKE 'dc:%'`,
-    );
-    database.exec(
-      `UPDATE chats SET channel = 'telegram', is_group = 1 WHERE jid LIKE 'tg:%'`,
-    );
   } catch {
     /* columns already exist */
   }
@@ -546,6 +549,7 @@ export function getRegisteredGroup(
         container_config: string | null;
         requires_trigger: number | null;
         authorized_mcp_servers: string | null;
+        authorized_skills: string | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -570,6 +574,9 @@ export function getRegisteredGroup(
     authorizedMcpServers: row.authorized_mcp_servers
       ? JSON.parse(row.authorized_mcp_servers)
       : undefined,
+    authorizedSkills: row.authorized_skills
+      ? JSON.parse(row.authorized_skills)
+      : undefined,
   };
 }
 
@@ -578,8 +585,8 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, authorized_mcp_servers)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, authorized_mcp_servers, authorized_skills)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -590,6 +597,9 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
     group.authorizedMcpServers
       ? JSON.stringify(group.authorizedMcpServers)
+      : null,
+    group.authorizedSkills
+      ? JSON.stringify(group.authorizedSkills)
       : null,
   );
 }
@@ -604,6 +614,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     container_config: string | null;
     requires_trigger: number | null;
     authorized_mcp_servers: string | null;
+    authorized_skills: string | null;
   }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
@@ -626,6 +637,9 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
       authorizedMcpServers: row.authorized_mcp_servers
         ? JSON.parse(row.authorized_mcp_servers)
+        : undefined,
+      authorizedSkills: row.authorized_skills
+        ? JSON.parse(row.authorized_skills)
         : undefined,
     };
   }
@@ -670,6 +684,47 @@ export function getAllChannelMappings(): Array<{
   return db
     .prepare('SELECT channel, chat_id, jid FROM channel_mappings')
     .all() as Array<{ channel: string; chat_id: string; jid: string }>;
+}
+
+// --- KV store accessors (structured memory) ---
+
+export function getKvState(
+  groupFolder: string,
+  key: string,
+): string | undefined {
+  const row = db
+    .prepare('SELECT value FROM kv_store WHERE group_folder = ? AND key = ?')
+    .get(groupFolder, key) as { value: string } | undefined;
+  return row?.value;
+}
+
+export function setKvState(
+  groupFolder: string,
+  key: string,
+  value: string,
+): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO kv_store (group_folder, key, value, updated_at) VALUES (?, ?, ?, ?)`,
+  ).run(groupFolder, key, value, new Date().toISOString());
+}
+
+export function deleteKvState(groupFolder: string, key: string): void {
+  db.prepare(
+    'DELETE FROM kv_store WHERE group_folder = ? AND key = ?',
+  ).run(groupFolder, key);
+}
+
+export function getAllKvStateForGroup(
+  groupFolder: string,
+): Record<string, string> {
+  const rows = db
+    .prepare('SELECT key, value FROM kv_store WHERE group_folder = ?')
+    .all(groupFolder) as Array<{ key: string; value: string }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) {
+    result[row.key] = row.value;
+  }
+  return result;
 }
 
 // --- JSON migration ---

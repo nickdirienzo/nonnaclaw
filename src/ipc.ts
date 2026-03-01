@@ -10,7 +10,14 @@ import {
   TIMEZONE,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteKvState,
+  deleteTask,
+  getTaskById,
+  setKvState,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { writeOutboxEvent } from './outbox.js';
@@ -164,6 +171,49 @@ export function startIpcWatcher(deps: IpcDeps): void {
       } catch (err) {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
       }
+
+      // Process state operations from this group's IPC directory
+      const stateDir = path.join(ipcBaseDir, sourceGroup, 'state');
+      try {
+        if (fs.existsSync(stateDir)) {
+          const stateFiles = fs
+            .readdirSync(stateDir)
+            .filter((f) => f.endsWith('.json'));
+          for (const file of stateFiles) {
+            const filePath = path.join(stateDir, file);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              if (data.type === 'save_state' && data.key && data.value != null) {
+                setKvState(sourceGroup, data.key, data.value);
+                logger.debug(
+                  { key: data.key, sourceGroup },
+                  'KV state saved via IPC',
+                );
+              } else if (data.type === 'delete_state' && data.key) {
+                deleteKvState(sourceGroup, data.key);
+                logger.debug(
+                  { key: data.key, sourceGroup },
+                  'KV state deleted via IPC',
+                );
+              }
+              fs.unlinkSync(filePath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC state',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              fs.mkdirSync(errorDir, { recursive: true });
+              fs.renameSync(
+                filePath,
+                path.join(errorDir, `${sourceGroup}-${file}`),
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.error({ err, sourceGroup }, 'Error reading IPC state directory');
+      }
     }
 
     setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
@@ -191,6 +241,7 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    authorizedSkills?: RegisteredGroup['authorizedSkills'];
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -399,6 +450,7 @@ export async function processTaskIpc(
           added_at: new Date().toISOString(),
           containerConfig: data.containerConfig,
           requiresTrigger: data.requiresTrigger,
+          authorizedSkills: data.authorizedSkills,
         });
       } else {
         logger.warn(

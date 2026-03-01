@@ -18,6 +18,9 @@ groups/global/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
 
+# Skills (cloned per-installation from external repos)
+skills/
+
 # Secrets
 *.keys.json
 .env

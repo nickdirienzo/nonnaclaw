@@ -14,6 +14,8 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const STATE_DIR = path.join(IPC_DIR, 'state');
+const STATE_SNAPSHOT = path.join(IPC_DIR, 'current_state.json');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -277,6 +279,92 @@ Use available_groups.json to find the JID for a group. The folder name should be
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
     };
+  },
+);
+
+// --- Structured memory (KV store) ---
+
+server.tool(
+  'save_state',
+  `Save a key-value pair that persists across agent invocations. Use this for remembering preferences, cursors, thread IDs, or any structured data that should survive between conversations.
+
+Values are scoped to this group — other groups cannot read or modify them.`,
+  {
+    key: z.string().describe('The key to save (e.g., "user_preference", "last_cursor")'),
+    value: z.string().describe('The value to save (will be stored as a string — use JSON.stringify for structured data)'),
+  },
+  async (args) => {
+    const data = {
+      type: 'save_state',
+      groupFolder,
+      key: args.key,
+      value: args.value,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(STATE_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `State saved: ${args.key}` }] };
+  },
+);
+
+server.tool(
+  'get_state',
+  `Read previously saved state for this group. Returns all saved key-value pairs, or a specific key's value.`,
+  {
+    key: z.string().optional().describe('Specific key to read. If omitted, returns all saved state.'),
+  },
+  async (args) => {
+    try {
+      if (!fs.existsSync(STATE_SNAPSHOT)) {
+        return { content: [{ type: 'text' as const, text: args.key ? 'Key not found.' : 'No saved state.' }] };
+      }
+
+      const allState: Record<string, string> = JSON.parse(
+        fs.readFileSync(STATE_SNAPSHOT, 'utf-8'),
+      );
+
+      if (args.key) {
+        const value = allState[args.key];
+        if (value === undefined) {
+          return { content: [{ type: 'text' as const, text: `Key "${args.key}" not found.` }] };
+        }
+        return { content: [{ type: 'text' as const, text: value }] };
+      }
+
+      if (Object.keys(allState).length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No saved state.' }] };
+      }
+
+      const formatted = Object.entries(allState)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join('\n');
+      return { content: [{ type: 'text' as const, text: formatted }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error reading state: ${err instanceof Error ? err.message : String(err)}` }],
+      };
+    }
+  },
+);
+
+server.tool(
+  'delete_state',
+  'Delete a previously saved key-value pair.',
+  {
+    key: z.string().describe('The key to delete'),
+  },
+  async (args) => {
+    const data = {
+      type: 'delete_state',
+      groupFolder,
+      key: args.key,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(STATE_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `State deleted: ${args.key}` }] };
   },
 );
 

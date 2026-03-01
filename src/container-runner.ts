@@ -24,8 +24,14 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
-import { collectMcpServers } from './skill-registry.js';
+import {
+  collectMcpServers,
+  collectProxiedMcpServers,
+} from './skill-registry.js';
 import { LoadedSkill, RegisteredGroup } from './types.js';
+
+/** Path to the compiled MCP proxy inside the container (after tsc) */
+const CONTAINER_MCP_PROXY_PATH = '/tmp/dist/mcp-proxy.js';
 
 // Module-level state for loaded skills (set by orchestrator on startup)
 let loadedSkills: LoadedSkill[] = [];
@@ -167,6 +173,7 @@ function buildVolumeMounts(
   const groupIpcDir = resolveGroupIpcPath(group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'state'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
@@ -227,6 +234,9 @@ function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Allow containers to reach host-side MCP bridges via host.docker.internal
+  args.push('--add-host=host.docker.internal:host-gateway');
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
@@ -305,12 +315,14 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    // Inject MCP servers for authorized skills
-    if (group.authorizedMcpServers && group.authorizedMcpServers.length > 0) {
-      input.additionalMcpServers = collectMcpServers(
-        loadedSkills,
-        group.authorizedMcpServers,
-      );
+    // Inject MCP servers for authorized skills (proxied with scoping rules)
+    const proxied = collectProxiedMcpServers(
+      loadedSkills,
+      group,
+      CONTAINER_MCP_PROXY_PATH,
+    );
+    if (Object.keys(proxied).length > 0) {
+      input.additionalMcpServers = proxied;
     }
 
     // Pass secrets via stdin (never written to disk or mounted as files)
@@ -704,4 +716,19 @@ export function writeGroupsSnapshot(
       2,
     ),
   );
+}
+
+/**
+ * Write KV state snapshot for the container to read.
+ * The in-container MCP server reads this for synchronous get_state calls.
+ */
+export function writeStateSnapshot(
+  groupFolder: string,
+  state: Record<string, string>,
+): void {
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+
+  const stateFile = path.join(groupIpcDir, 'current_state.json');
+  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
 }

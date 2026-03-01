@@ -32,6 +32,11 @@ export interface ContainerConfig {
   timeout?: number; // Default: 300000 (5 minutes)
 }
 
+/** Per-skill scoping config for a group */
+export interface SkillScope {
+  pinnedParams?: Record<string, string>; // "tool.param" → value
+}
+
 export interface RegisteredGroup {
   name: string;
   folder: string;
@@ -39,23 +44,49 @@ export interface RegisteredGroup {
   added_at: string;
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
+  /** @deprecated Use authorizedSkills instead */
   authorizedMcpServers?: string[];
+  /** Per-skill authorization with scoping config */
+  authorizedSkills?: Record<string, SkillScope>;
 }
 
 // --- Skill system types ---
+
+/** Scope template rule — skill author declares which tools to expose and which params are security-sensitive */
+export interface ScopeTemplateRule {
+  allow: boolean;
+  scopedParams?: string[]; // param names that must be pinned per-group (e.g., ["chat_id"])
+}
 
 export interface SkillManifest {
   name: string;
   version: string;
   description?: string;
+  /** The MCP server this skill provides (proxied to agents with scoping) */
+  mcp?: {
+    command: string;
+    args?: string[];
+    envKeys?: string[]; // env var names — values resolved from .env at runtime
+    /** MCP tool to poll for inbound messages (e.g., "list_messages") */
+    pollTool?: string;
+    /** Poll interval in ms (default: 5000) */
+    pollIntervalMs?: number;
+    /** Argument name for the "since" timestamp when polling (default: "since") */
+    pollTimestampArg?: string;
+  };
+  /** Declares which tools to expose and which params need per-group pinning */
+  scopeTemplate?: Record<string, ScopeTemplateRule>;
+  /** @deprecated Use mcp + scopeTemplate. Kept for backward compat with handler-based skills. */
   inbound?: {
     entrypoint: string; // relative path, e.g. "./inbound.js"
     intervalMs?: number; // poll interval, min 1000ms (required for poll mode)
     persistent?: boolean; // if true, process runs continuously (restart on crash)
   };
+  /** @deprecated Use mcp + scopeTemplate. */
   outbound?: {
     jidPatterns: string[]; // glob patterns for JIDs this skill handles, e.g. ["*@g.us"]
   };
+  /** @deprecated Use mcp field instead. Agent-facing MCP servers (legacy). */
   mcpServers?: Record<
     string,
     {
@@ -129,29 +160,3 @@ export interface TaskRunLog {
   error: string | null;
 }
 
-// --- Channel abstraction ---
-
-export interface Channel {
-  name: string;
-  connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
-  isConnected(): boolean;
-  ownsJid(jid: string): boolean;
-  disconnect(): Promise<void>;
-  // Optional: typing indicator. Channels that support it implement it.
-  setTyping?(jid: string, isTyping: boolean): Promise<void>;
-}
-
-// Callback type that channels use to deliver inbound messages
-export type OnInboundMessage = (chatJid: string, message: NewMessage) => void;
-
-// Callback for chat metadata discovery.
-// name is optional — channels that deliver names inline (Telegram) pass it here;
-// channels that sync names separately (e.g., via metadata sync) omit it.
-export type OnChatMetadata = (
-  chatJid: string,
-  timestamp: string,
-  name?: string,
-  channel?: string,
-  isGroup?: boolean,
-) => void;

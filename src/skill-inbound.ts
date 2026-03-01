@@ -22,6 +22,7 @@ export interface InboundDeps {
     timestamp: string;
     is_from_me: boolean;
     is_bot_message?: boolean;
+    is_group?: boolean;
   }) => void;
   storeChatMetadata?: (
     chatJid: string,
@@ -281,6 +282,7 @@ function pollInbox(deps: InboundDeps): void {
           timestamp: event.timestamp,
           is_from_me: false,
           is_bot_message: event.metadata?.isBotMessage === true,
+          is_group: event.metadata?.isGroup === true ? true : undefined,
         });
 
         fs.unlinkSync(filePath);
