@@ -1,6 +1,6 @@
 # NonnaClaw 🤌
 
-An experimental fork of [NanoClaw](https://github.com/qwibitai/nanoclaw) exploring a skill model that adds capabilities without modifying the code: using MCP servers, filesystem IPC, and scoped authorization instead of code generation.
+An experimental fork of [NanoClaw](https://github.com/qwibitai/nanoclaw) with a stable core that adds capabilities entirely through external MCP servers: no code changes, no new dependencies, just a `skill.json` manifest and whatever the MCP ecosystem already provides.
 
 *Nonna = Italian for grandmother. She runs a tight kitchen.*
 
@@ -8,17 +8,11 @@ An experimental fork of [NanoClaw](https://github.com/qwibitai/nanoclaw) explori
 
 ## Philosophy
 
-NonnaClaw is named after the Italian grandmother who keeps her kitchen *immaculate*. 🤌
+*Nonna runs a tight kitchen; she wants it immaculate while using the best ingredients possible.* 🤌
 
-**Her kitchen is small, and she knows where everything is.** The core is a handful of files. If you can't read the whole thing in one sitting, something went wrong.
+The goal is a stable core: routing and execution code that doesn't change when you add capabilities. New channels and integrations are added entirely through external MCP servers, declared via a `skill.json` manifest. No code changes, no new dependencies in core, no merge conflicts.
 
-**Every dish gets its own pot.** Skills are self-contained: own repo, own dependencies, own MCP server. You don't dump the pasta water into the risotto.
-
-**You bring ingredients, you follow her system.** Skills talk to core through one contract: a `skill.json` manifest declaring what tools you bring and how to poll for messages. No rearranging her cabinets.
-
-**She decides who touches the good knives.** Each agent only gets the MCP tools explicitly authorized for its group. Nonna holds the credentials, scopes the parameters, and proxies the calls. You get tool results back.
-
-**If it doesn't belong in the kitchen, it stays outside.** MCP servers and inbound polling run on the host (trusted zone). The agent's container is the kitchen: sandboxed, scoped, and under Nonna's supervision.
+This means you can leverage the entire MCP ecosystem. If an MCP server exists for a service, you can wire it into NonnaClaw as a skill without writing any NonnaClaw-specific code. The core just bridges, scopes, and routes.
 
 ## How It Differs From NanoClaw
 
@@ -32,7 +26,7 @@ NonnaClaw takes a different approach:
 
 - **Skills don't touch core code.** A skill is a `skill.json` manifest and a `SKILL.md` setup guide. No codemods, no SQLite migrations in core, no new imports in index.ts.
 - **Skills own their own dependencies.** A WhatsApp skill pulls in whatsapp-mcp. A Telegram skill pulls in telegram-mcp. Neither knows about the other. Neither pollutes core.
-- **Community MCP servers for everything.** Inbound polling and outbound actions both go through the same upstream MCP server. We don't write NonnaClaw-specific ones. The whole point is to leverage what already exists.
+- **Existing MCP servers for everything.** Inbound polling and outbound actions both go through the same upstream MCP server. We don't write NonnaClaw-specific ones. The whole point is to leverage what already exists.
 - **Two independent security boundaries.** Container filesystem isolation controls what the agent can see. MCP authorization (via `scopeTemplate`) controls what the agent can do.
 
 ## The Experiment
@@ -44,9 +38,13 @@ The thesis is that you can add channels to a personal AI assistant without modif
 - Adding dependencies to core package.json: the skill isolation is wrong
 - Any SQLite migration in core: the state ownership boundary is wrong
 
-So far, WhatsApp works as a fully external skill: a `skill.json` manifest pointing at a community MCP server, a `SKILL.md` setup guide, and zero lines changed in core. That's one channel. The experiment is whether this holds as more get added.
+So far, WhatsApp and GitHub both work as fully external skills: a `skill.json` manifest pointing at an MCP server, a `SKILL.md` setup guide, and zero lines changed in core. The experiment is whether this holds as more get added.
 
-Here's a WhatsApp message hitting two external MCP skills (WhatsApp for the channel, GitHub for the query) with no core code involved:
+Skill repos:
+- [nonnaclaw-whatsapp](https://github.com/nickdirienzo/nonnaclaw-whatsapp) — WhatsApp channel via MCP server
+- [nonnaclaw-github](https://github.com/nickdirienzo/nonnaclaw-github) — GitHub integration via MCP server
+
+Here's a WhatsApp message hitting both skills (WhatsApp for the channel, GitHub for the query) with no core code involved:
 
 <p align="center">
   <img src="assets/whatsapp-git-demo.png" width="300" alt="WhatsApp conversation where Nonna answers a git query using two external MCP skills" />
@@ -55,40 +53,42 @@ Here's a WhatsApp message hitting two external MCP skills (WhatsApp for the chan
 ## Architecture
 
 ```
-nonnaclaw-skills/whatsapp/               nonnaclaw-skills/telegram/
+nonnaclaw-skills/whatsapp/               nonnaclaw-skills/github/
 +----------------------+                +----------------------+
-| Community MCP Server |                | Community MCP Server |
-| (stdio)              |                | (stdio)              |
+| MCP Server           |                | MCP Server           |
+| (stdio subprocess)   |                | (stdio subprocess)   |
 +----------+-----------+                +----------+-----------+
            |                                       |
            v                                       v
 +-------------------------------------------------------------+
-|  Host: src/mcp-bridge.ts                                     |
+|  Host                                                        |
+|                                                              |
+|  MCP Proxy (src/mcp-bridge.ts)                               |
 |  +-------------------------+  +-------------------------+    |
-|  | WhatsApp Bridge         |  | Telegram Bridge          |   |
-|  | - StdioClientTransport  |  | - StdioClientTransport   |   |
+|  | WhatsApp Bridge         |  | GitHub Bridge            |   |
+|  | - Upstream: stdio       |  | - Upstream: stdio        |   |
 |  | - HTTP endpoint :19700  |  | - HTTP endpoint :19701   |   |
-|  | - Polls list_messages   |  | - Polls getUpdates       |   |
+|  | - Polls list_messages   |  |                          |   |
 |  | - Per-group scopes:     |  | - Per-group scopes:      |   |
-|  |   /mcp/family → filtered|  |   /mcp/work → filtered   |   |
-|  |   /mcp/work → filtered  |  |                          |   |
+|  |   /mcp/family → filtered|  |   /mcp/family → filtered |   |
+|  |   /mcp/work → filtered  |  |   /mcp/work → filtered   |   |
 |  +-------------------------+  +-------------------------+    |
+|  Scope enforcement happens here: tool allowlists,            |
+|  pinned parameters, credential injection. The agent          |
+|  never sees tools it isn't authorized for.                   |
 |                                                              |
 |  Orchestrator (src/index.ts)                                 |
 |  - Message loop, group routing, container spawning           |
 |  - IPC watcher, task scheduler, KV store                     |
-|  - Nonna at the pass: routes inbound, dispatches outbound    |
 +----------------------------+---------------------------------+
                              | HTTP (host.docker.internal:PORT/mcp/{group})
                              v
-+-- Agent Container -----------------------------------------------+
++-- Agent Container (sandboxed) -----------------------------------+
 |  MCP Forwarder (mcp-forwarder.ts)                                |
-|  - Dumb stdio-to-HTTP adapter (zero filtering)                   |
-|  - Scope enforcement is on the HOST, not here                    |
-|  - Agent only sees tools the host-side scope allows              |
+|  - Dumb stdio-to-HTTP adapter, zero filtering                    |
 |                                                                  |
-|  NonnaClaw MCP (ipc-mcp-stdio.ts)                                |
-|  - send_message, schedule_task, save_state, etc.                 |
+|  IPC MCP (ipc-mcp-stdio.ts)                                     |
+|  - send_message, schedule_task, save_state                       |
 |                                                                  |
 |  Claude Agent SDK                                                |
 +------------------------------------------------------------------+
@@ -106,7 +106,7 @@ A skill is its own git repo, installed as a sibling directory under `nonnaclaw-s
 {
   "name": "whatsapp",
   "version": "2.0.0",
-  "description": "WhatsApp channel via community MCP server",
+  "description": "WhatsApp channel via MCP server",
   "mcp": {
     "command": "uv",
     "args": ["--directory", "./whatsapp-mcp/whatsapp-mcp-server", "run", "main.py"],
@@ -142,7 +142,7 @@ The skill never touches core source files. It only configures itself and registe
 | **Inbound on host, outbound via host** | If the agent runs its own inbound listener, a compromised agent can forge or filter incoming messages. Outbound goes through the host bridge too — Nonna sees everything that comes in and goes out. |
 | **MCP auth broker on host** | The host holds credentials and proxies tool calls. The agent never sees raw tokens. |
 | **Scope enforcement on host** | Tool allowlists and pinned params are enforced on the host, not in the container. The container runs a dumb forwarder — a compromised agent can't modify, kill, or bypass the filtering logic. |
-| **Community MCP servers for outbound** | Writing NonnaClaw-specific MCP servers defeats the purpose. Use what exists. |
+| **Existing MCP servers for outbound** | Writing NonnaClaw-specific MCP servers defeats the purpose. Use what exists — official or community. |
 
 ## Quick Start
 
@@ -175,7 +175,7 @@ Inherited from NanoClaw:
 
 Added by NonnaClaw:
 
-- **Any MCP-compatible channel.** WhatsApp, Telegram, Slack, and anything with a community MCP server.
+- **Any MCP-compatible channel.** WhatsApp, Telegram, Slack, and anything with an MCP server.
 - **Scoped tool access.** Groups only see the tools and parameters they're authorized for via `scopeTemplate`.
 
 ## Requirements
@@ -209,7 +209,7 @@ Added by NonnaClaw:
 
 This is experimental. I'm using it to test whether the external skill model actually works in practice.
 
-For the full motivation, see [Exploring External Skills in NanoClaw](https://nickdirienzo.com/exploring-external-skills-in-nano-claw/).
+For the full motivation, see [Exploring External Skills in NanoClaw](https://nickdirienzo.com/exploring-external-skills-in-nano-claw/) and [Why Aren't Claw Skills Just MCP Server Install Instructions?](https://nickdirienzo.com/why-aren-t-claw-skills-just-mcp-server-install-instructions/)
 
 ## Ancestry
 
